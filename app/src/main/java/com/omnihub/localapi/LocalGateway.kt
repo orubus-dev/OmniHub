@@ -123,7 +123,8 @@ class LocalGateway(
         val completionId = "chatcmpl-omni-${System.currentTimeMillis()}"
 
         if (!stream) {
-            val (content, usedModel) = runCompletion(modelId, messages)
+            // NanoHTTPD worker thread — blocking here is the contract
+            val (content, usedModel) = kotlinx.coroutines.runBlocking { runCompletion(modelId, messages) }
             val out = JSONObject()
                 .put("id", completionId)
                 .put("object", "chat.completion")

@@ -63,6 +63,8 @@ class McpClient(private val context: Context) {
     private val prefs = context.getSharedPreferences("omnihub_mcp", Context.MODE_PRIVATE)
     private val sessions = ConcurrentHashMap<String, Session>()
     private val ids = AtomicInteger(1)
+
+    private fun nextId(): Int = ids.getAndIncrement()
     private val JSON = "application/json".toMediaType()
 
     private val http: OkHttpClient = OkHttpClient.Builder()
@@ -272,7 +274,7 @@ class McpClient(private val context: Context) {
             // 2) Legacy HTTP+SSE
             try {
                 handshakeLegacySse(safeUrl)?.let { hs ->
-                    sessions[id] = hs.session
+                    hs.session?.let { sessions[id] = it }
                     val server = McpServer(
                         id = id,
                         name = name.ifBlank { hs.serverName ?: "MCP @ ${safeUrl.take(40)}" },
@@ -394,7 +396,7 @@ class McpClient(private val context: Context) {
         val tools = listResp.optJSONObject("result")?.let { parseTools(it) } ?: emptyList()
 
         // Keep the stream open for future calls; Session carries reader+response.
-        return Handshake(tools, protoVer, serverName, session)
+        return Handshake(tools = tools, protocolVersion = protoVer, serverName = serverName, session = session)
     }
 
     private fun postBlind(url: String, payload: JSONObject, sessionId: String?) {

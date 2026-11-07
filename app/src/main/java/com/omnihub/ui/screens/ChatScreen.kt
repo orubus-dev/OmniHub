@@ -349,7 +349,7 @@ fun ChatScreen(
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             IconButton(onClick = { scope.launch { if (drawerState.isClosed) drawerState.open() else drawerState.close() } }) { Icon(Icons.Default.Menu, "Menu", tint = OmniAmber) }
-                            IconButton(onClick = toggleIncognito) { Icon(Icons.Outlined.VisibilityOff, "Incognito", tint = if (incognito) OmniAmber else MaterialTheme.colorScheme.onSurfaceVariant) }
+                            IconButton(onClick = { toggleIncognito() }) { Icon(Icons.Outlined.VisibilityOff, "Incognito", tint = if (incognito) OmniAmber else MaterialTheme.colorScheme.onSurfaceVariant) }
                             if (incognito) Text("Incognito", style = MaterialTheme.typography.labelMedium, color = OmniAmber)
                         }
                     },

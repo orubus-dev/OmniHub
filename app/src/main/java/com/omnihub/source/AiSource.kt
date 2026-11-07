@@ -80,7 +80,13 @@ interface AiSource {
 
     suspend fun configure(config: SourceConfig) {}
     suspend fun chat(request: SourceChatRequest): ChatResponse
-    suspend fun stream(request: SourceChatRequest): Flow<String> = flow {
+
+    /**
+     * Streaming lane. Emits CUMULATIVE reply snapshots (not diffs) so every
+     * consumer — chat UI, local gateway, router — just replaces what it has.
+     * Default: one full snapshot after chat() completes.
+     */
+    fun stream(request: SourceChatRequest): Flow<String> = flow {
         emit(chat(request).content)
     }
     suspend fun validateCredentials(): Boolean = isConfigured()
