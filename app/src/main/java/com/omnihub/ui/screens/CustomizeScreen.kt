@@ -14,6 +14,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.omnihub.OmniHubApp
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -162,15 +164,11 @@ private fun ToneTab() {
 
 @Composable
 private fun McpServerTab() {
+    val app = OmniHubApp.instance
+    val scope = rememberCoroutineScope()
     var url by remember { mutableStateOf("") }
-    var servers by remember {
-        mutableStateOf(
-            listOf(
-                "Local filesystem MCP" to true,
-                "GitHub MCP" to false
-            )
-        )
-    }
+    var status by remember { mutableStateOf<String?>(null) }
+    var servers by remember { mutableStateOf(app.mcp.listServers()) }
 
     Column(
         Modifier
@@ -180,7 +178,7 @@ private fun McpServerTab() {
     ) {
         Text("MCP Servers", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Text(
-            "Paste an MCP server URL (SSE or Streamable HTTP). Complete any login the server requires — then its tools are available. Same flow as Claude & Grok.",
+            "Paste an MCP server URL (Streamable HTTP or SSE). OmniHub performs the full MCP handshake — initialize, session, tools — then its tools are available to your assistant.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.outline
         )
@@ -197,9 +195,25 @@ private fun McpServerTab() {
 
         Button(
             onClick = {
-                if (url.isNotBlank()) {
-                    servers = servers + (url.take(40) to true)
+                val target = url.trim()
+                if (target.isNotBlank()) {
                     url = ""
+                    status = "Handshaking with ${target.take(40)}…"
+                    scope.launch {
+                        val result = app.mcp.connect(target)
+                        result.fold(
+                            onSuccess = { s ->
+                                status = if (s.connected)
+                                    "Connected: ${s.name} — ${s.tools.size} tools"
+                                else "Server saved but handshake failed: ${s.lastError}"
+                                servers = app.mcp.listServers()
+                            },
+                            onFailure = { e ->
+                                status = "Failed: ${e.message}"
+                                servers = app.mcp.listServers()
+                            }
+                        )
+                    }
                 }
             },
             modifier = Modifier.fillMaxWidth(),
@@ -210,10 +224,17 @@ private fun McpServerTab() {
             Text("Connect MCP Server")
         }
 
+        status?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
+
         Divider()
 
         Text("Connected", style = MaterialTheme.typography.titleSmall)
-        servers.forEach { (name, connected) ->
+        if (servers.isEmpty()) {
+            Text("No MCP servers yet.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+        }
+        servers.forEach { server ->
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp)
@@ -225,13 +246,25 @@ private fun McpServerTab() {
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
-                        Text(name, fontWeight = FontWeight.Medium)
-                        Text(if (connected) "Connected" else "Disconnected", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                    Column(Modifier.weight(1f)) {
+                        Text(server.name, fontWeight = FontWeight.Medium)
+                        Text(
+                            if (server.connected)
+                                "Connected — ${server.tools.size} tools" +
+                                    (server.tools.take(5).takeIf { it.isNotEmpty() }?.let { ": ${it.joinToString()}" } ?: "")
+                            else
+                                "Disconnected${server.lastError?.let { " — $it" } ?: ""}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline
+                        )
                     }
-                    if (connected) {
+                    if (server.connected) {
                         Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.primary)
                     }
+                    TextButton(onClick = {
+                        app.mcp.disconnect(server.id)
+                        servers = app.mcp.listServers()
+                    }) { Text("Remove") }
                 }
             }
         }
