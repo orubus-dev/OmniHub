@@ -38,7 +38,14 @@ jobs:
           distribution: 'temurin'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        run: |
+          set -e
+          # ubuntu-latest ships the SDK; the old setup-android action broke
+          # trying to install the removed 'tools' package. Accept licenses and
+          # ensure the components AGP 8.5 + compileSdk 35 need.
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "platform-tools" > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --list_installed | head -20 || true
 
       - name: Restore Gradle Wrapper
         run: |
