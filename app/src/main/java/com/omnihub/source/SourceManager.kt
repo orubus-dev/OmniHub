@@ -19,10 +19,14 @@ class SourceManager(private val context: Context) {
 
     fun reload() {
         val fromApks = InstalledSourceScanner.toSources(context)
-        // Prefer APK-installed; merge descriptors without duplicates
-        val ids = fromApks.map { it.info.id }.toSet()
+        // Built-in keyless sources (WebView-native lanes) — APK installs win on id clash
+        val builtIns = listOf(com.omnihub.source.web.DuckAiSource(context))
+            .filter { b -> fromApks.none { it.info.id == b.info.id } }
+        val all = fromApks + builtIns
+        // Merge descriptors without duplicates
+        val ids = all.map { it.info.id }.toSet()
         val extra = installedDescriptors.filter { it.info.id !in ids }
-        _sources.value = fromApks + extra
+        _sources.value = all + extra
     }
 
     fun all(): List<AiSource> = _sources.value

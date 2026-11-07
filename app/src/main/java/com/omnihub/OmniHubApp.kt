@@ -6,6 +6,7 @@ import com.omnihub.analytics.AnalyticsRepository
 import com.omnihub.core.OmniRouter
 import com.omnihub.history.ChatRepository
 import com.omnihub.history.IncognitoRetention
+import com.omnihub.localapi.LocalGateway
 import com.omnihub.mcp.McpClient
 import com.omnihub.providers.ProviderRegistry
 import com.omnihub.providers.impl.ProviderBootstrap
@@ -44,6 +45,8 @@ class OmniHubApp : Application() {
         private set
     lateinit var terminal: OmniTerminal
         private set
+    var localGateway: LocalGateway? = null
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -63,6 +66,20 @@ class OmniHubApp : Application() {
         router = OmniRouter(registry)
         sourceRouter = SourceRouter(sourceManager, soul, issueReporter)
         IncognitoRetention.purgeExpired(this)
+        if (getSharedPreferences("omnihub_localapi", MODE_PRIVATE).getBoolean("enabled", false)) {
+            try { startLocalGateway() } catch (_: Exception) { }
+        }
+    }
+
+    /** Local OpenAI-compatible endpoint over signed-in sources (OmniRoute mode). */
+    fun startLocalGateway(port: Int = LocalGateway.DEFAULT_PORT) {
+        if (LocalGateway.running.get()) return
+        localGateway = LocalGateway(this, port).also { it.startGateway() }
+    }
+
+    fun stopLocalGateway() {
+        localGateway?.stop()
+        localGateway = null
     }
 
     fun reloadProviders() {
