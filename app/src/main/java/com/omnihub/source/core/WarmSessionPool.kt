@@ -25,10 +25,34 @@ object WarmSessionPool {
         var lastTransactionId: String = "",
         var observerInstalled: Boolean = false
     )
-
     private val main = Handler(Looper.getMainLooper())
     private val sessions = ConcurrentHashMap<String, Session>()
-    private const val MAX_SESSIONS = 4
+    private const val MAX_SESSIONS = 5
+
+    /**
+     * Pre-load a provider page in the background so the FIRST message is hot.
+     * Called at app start (duck.ai + preferred provider) and whenever the user
+     * picks a provider. Kills the 15-30s cold load from the first reply.
+     */
+    fun warm(context: Context, providerId: String, siteUrl: String) {
+        if (siteUrl.isBlank()) return
+        runOnMain {
+            try {
+                val s = getOrCreate(context, providerId)
+                if (!s.ready && !s.busy && s.lastUrl.isBlank()) {
+                    s.web.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            s.lastUrl = url.orEmpty()
+                            s.ready = true
+                            s.observerInstalled = false
+                        }
+                    }
+                    s.web.loadUrl(siteUrl)
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     fun getOrCreate(context: Context, providerId: String): Session {

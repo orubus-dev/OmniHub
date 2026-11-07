@@ -6,6 +6,9 @@ import com.omnihub.source.*
 import com.omnihub.source.core.ProviderAuthStore
 import com.omnihub.source.core.ProviderBridge
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 
 class WebProviderSource(
@@ -24,7 +27,7 @@ class WebProviderSource(
         description = description,
         websiteUrl = siteUrl,
         bundled = true,
-        capabilities = SourceCapabilities(chat = true, coding = true, research = true)
+        capabilities = SourceCapabilities(chat = true, stream = true, coding = true, research = true)
     )
 
     // Always attempt; bridge decides guest vs session
@@ -44,4 +47,27 @@ class WebProviderSource(
             kind = if (kind == SourceKind.MCP) "MCP" else "WEB"
         )
     }
+
+    /** True streaming: partial page text flows out while the provider writes. */
+    override fun stream(request: SourceChatRequest): Flow<String> = flow {
+        var finalText = ""
+        var finalOk = false
+        ProviderBridge.streamChat(
+            context = context,
+            providerId = sourceId,
+            providerName = sourceName,
+            siteUrl = siteUrl,
+            messages = request.messages,
+            kind = if (kind == SourceKind.MCP) "MCP" else "WEB"
+        ).collect { tok ->
+            if (tok.done) {
+                finalText = tok.text
+                finalOk = tok.ok
+            } else if (tok.text.isNotBlank()) {
+                emit(tok.text)
+            }
+        }
+        if (!finalOk) throw IllegalStateException(finalText.ifBlank { "$sourceName relay failed" })
+        emit(finalText)
+    }.flowOn(Dispatchers.IO)
 }

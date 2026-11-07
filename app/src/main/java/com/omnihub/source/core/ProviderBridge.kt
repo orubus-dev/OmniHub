@@ -19,7 +19,13 @@ import java.util.concurrent.atomic.AtomicReference
 
 object ProviderBridge {
 
-    data class StreamToken(val text: String, val done: Boolean = false)
+    data class StreamToken(
+        val text: String,
+        val done: Boolean = false,
+        val sourceId: String = "",
+        val sourceName: String = "",
+        val ok: Boolean = true
+    )
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -41,38 +47,58 @@ object ProviderBridge {
         kind
     )
 
+    /** Compact transcript of prior turns — typed in on COLD sessions only, so a
+     *  provider the user just switched to still knows the thread. */
+    fun contextPrefixFor(messages: List<ChatMessage>, memoryContext: String? = null): String {
+        val prior = messages.dropLast(1).filter { it.content.isNotBlank() }
+        val transcript = if (prior.isEmpty()) "" else prior
+            .joinToString("\n") { "${if (it.role == "user") "User" else "Assistant"}: ${it.content.take(1200)}" }
+            .let { if (it.length > 3500) "…(earlier turns trimmed)…\n" + it.takeLast(3200) else it }
+        return when {
+            transcript.isNotBlank() ->
+                "Earlier in this conversation (you were the assistant). Continue seamlessly from the last message:\n$transcript"
+            !memoryContext.isNullOrBlank() ->
+                "Context about the user and this conversation (memory):\n$memoryContext"
+            else -> ""
+        }
+    }
+
     /**
      * Live stream: emits cumulative cleaned text as the page grows (done=false),
-     * then a final token (done=true).
+     * then a final token (done=true). Failure of one candidate NEVER becomes a
+     * reply — it is recorded and the next candidate runs (bounded by
+     * [maxCandidates] so a row of dead providers can never cost minutes).
      */
     fun streamChatWithFallback(
         context: Context,
         candidates: List<Triple<String, String, String>>,
         messages: List<ChatMessage>,
-        kind: String = "WEB"
+        kind: String = "WEB",
+        maxCandidates: Int = 4
     ): Flow<StreamToken> = callbackFlow {
-        if (candidates.isEmpty()) {
-            trySend(StreamToken("No source installed. Open Store → install → Sign in.", done = true))
+        val tried = candidates.take(maxCandidates)
+        if (tried.isEmpty()) {
+            trySend(StreamToken("No source installed. Open Store → install → Sign in.", done = true, ok = false))
             close()
             return@callbackFlow
         }
         val last = messages.lastOrNull { it.role == "user" }?.content.orEmpty()
         if (last.isBlank()) {
-            trySend(StreamToken("Empty message.", done = true))
+            trySend(StreamToken("Empty message.", done = true, ok = false))
             close()
             return@callbackFlow
         }
 
         val job = launch(Dispatchers.IO) {
             val errors = mutableListOf<String>()
-            for ((id, name, url) in candidates) {
+            for ((id, name, url) in tried) {
                 if (ProviderCooldown.isCooling(context, id)) {
                     errors += ProviderCooldown.message(context, id, name)
                     continue
                 }
                 if (kind.equals("MCP", true)) {
                     val mcp = runMcpAction(context, id, name, url, last)
-                    trySend(StreamToken(mcp, done = true))
+                    trySend(StreamToken(mcp, done = true, sourceId = id, sourceName = name))
                     close()
                     return@launch
                 }
@@ -94,11 +120,12 @@ object ProviderBridge {
                         siteUrl = url.ifBlank { "https://$host" },
                         providerId = id,
                         userMessage = last,
+                        contextPrefix = contextPrefixFor(messages),
                         onPartial = { partial ->
                             val cleaned = ReplySanitizer.strip(partial)
                             if (cleaned.isNotBlank() && cleaned != lastPartial.get()) {
                                 lastPartial.set(cleaned)
-                                trySend(StreamToken(cleaned, done = false))
+                                trySend(StreamToken(cleaned, done = false, sourceId = id, sourceName = name))
                             }
                         }
                     )
@@ -109,19 +136,17 @@ object ProviderBridge {
                     )
                 }
 
-                val text = if (result.ok) {
-                    ReplySanitizer.strip(result.text).ifBlank { result.text }
-                } else {
-                    val err = result.text
-                    if (looksBlocked(err)) {
-                        ProviderCooldown.markBlocked(context, id, 15)
-                        "$name blocked this session. Cooling down 15m. Switch provider or long-press → Add account."
-                    } else err
+                // A failed relay is a FAILURE — record it and fall through to the
+                // next candidate. It is never shown to the user as a reply.
+                if (!result.ok) {
+                    errors += "$name: ${result.text.take(160)}"
+                    continue
                 }
 
+                val text = ReplySanitizer.strip(result.text).ifBlank { result.text }
                 if (looksBlocked(text)) {
                     ProviderCooldown.markBlocked(context, id, 15)
-                    errors += text
+                    errors += "$name blocked this session. Cooling down 15m."
                     continue
                 }
                 if (text.startsWith("Not signed in") || text.contains("input not found", true) ||
@@ -131,7 +156,7 @@ object ProviderBridge {
                     continue
                 }
 
-                trySend(StreamToken(text, done = true))
+                trySend(StreamToken(text, done = true, sourceId = id, sourceName = name))
                 close()
                 return@launch
             }
@@ -139,7 +164,8 @@ object ProviderBridge {
                 StreamToken(
                     "All providers failed or are cooling down.\n" +
                         errors.distinct().take(3).joinToString("\n"),
-                    done = true
+                    done = true,
+                    ok = false
                 )
             )
             close()

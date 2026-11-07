@@ -37,13 +37,18 @@ import com.omnihub.OmniHubApp
 import com.omnihub.data.UserPrefs
 import com.omnihub.history.ConversationEntity
 import com.omnihub.providers.ChatMessage
+import com.omnihub.source.SourceRouter
+import com.omnihub.source.SourceHealth
 import com.omnihub.source.core.ProviderAuthStore
-import com.omnihub.source.core.ProviderBridge
+import com.omnihub.source.core.WarmSessionPool
 import com.omnihub.update.AppUpdateChecker
 import com.omnihub.update.AppUpdateInfo
 import com.omnihub.ui.theme.OmniAmber
 import com.omnihub.ui.theme.OmniGlassBorder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Calendar
@@ -64,6 +69,14 @@ private fun timeGreeting(name: String): String {
     val head = if (name.isBlank()) "$base." else "$base, $name."
     return "$head\n${GREETINGS[hour % GREETINGS.size]}"
 }
+
+/** Relay/engine failures must never look like AI prose. */
+private fun looksLikeError(t: String): Boolean = listOf(
+    "REPLY_TIMEOUT", "AUTH_REQUIRED", "COLD_LOAD_TIMEOUT", "SEND_FAILED",
+    "NO_COMPOSER", "INPUT_FAILED", "SEND_CLICK_FAILED", "Not signed in",
+    "No source installed", "All providers failed", "cooling down",
+    "relay failed", "empty reply"
+).any { t.contains(it, ignoreCase = true) }
 
 @Composable
 private fun BounceDots() {
@@ -129,6 +142,12 @@ fun ChatScreen(
     val sources by app.sourceManager.sources.collectAsState()
     var uiLocked by remember { mutableStateOf(false) }
 
+    // Live-reply metadata: who answered, how fast, and a cancellable job
+    var sendJob by remember { mutableStateOf<Job?>(null) }
+    var replySource by remember { mutableStateOf("") }
+    var replyMs by remember { mutableStateOf(0L) }
+    var elapsedSec by remember { mutableStateOf(0) }
+
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         if (uris.isNotEmpty()) pendingAttachments = pendingAttachments + uris.map { it.toString() }
     }
@@ -161,6 +180,8 @@ fun ChatScreen(
         messages = emptyList()
         persistActive(null)
         pendingAttachments = emptyList()
+        replySource = ""
+        replyMs = 0
         greeting = timeGreeting(UserPrefs.getName(context))
     }
 
@@ -176,6 +197,13 @@ fun ChatScreen(
         return sources.find { it.info.id == preferred }?.info?.name ?: preferred
     }
 
+    fun warmProvider(id: String) {
+        val src = sources.find { it.info.id == id } ?: return
+        // duck.ai's relay lane lives under a different pool key than its source id
+        val poolId = if (id == "duck_ai") "duckduckgo_ai" else id
+        WarmSessionPool.warm(context, poolId, src.info.websiteUrl)
+    }
+
     LaunchedEffect(Unit) {
         greeting = timeGreeting(UserPrefs.getName(context))
         app.sourceManager.reload()
@@ -183,6 +211,18 @@ fun ChatScreen(
         launch { app.chatRepo.observeConversations().collect { conversations = it } }
         launch { app.chatRepo.observeProjects().collect { projects = it } }
         launch { updateInfo = runCatching { AppUpdateChecker.checkOmniHub(context) }.getOrNull() }
+        if (preferred != "auto") warmProvider(preferred)
+    }
+
+    // Live stopwatch while a reply is streaming
+    LaunchedEffect(sending) {
+        if (sending) {
+            elapsedSec = 0
+            while (sending) {
+                delay(1000)
+                elapsedSec++
+            }
+        }
     }
 
     fun send() {
@@ -196,10 +236,12 @@ fun ChatScreen(
         sending = true
         answering = false
         uiLocked = true
+        replySource = ""
+        replyMs = 0
         val baseline = messages
         messages = baseline + ChatBubble("user", userText) + ChatBubble("assistant", "")
 
-        scope.launch {
+        sendJob = scope.launch {
             var convId = currentConvId
             try {
                 if (!incognito) {
@@ -214,41 +256,38 @@ fun ChatScreen(
                 }
 
                 val hist = (baseline + ChatBubble("user", userText)).map { ChatMessage(it.role, it.content) }
-                val preferredId = if (preferred == "auto") null else preferred
-                val allSources = app.sourceManager.all()
-                val ordered = buildList {
-                    if (preferredId != null) allSources.find { it.info.id == preferredId }?.let { add(it) }
-                    allSources.filter { preferredId == null || it.info.id != preferredId }.forEach { add(it) }
-                }
-                val candidates = ordered.map { Triple(it.info.id, it.info.name, it.info.websiteUrl) }
 
-                var reply = if (candidates.isEmpty()) {
-                    "No source installed. Open Store → install → Providers → Sign in."
-                } else {
-                    var last = ""
-                    ProviderBridge.streamChatWithFallback(
-                        context = context,
-                        candidates = candidates,
-                        messages = hist,
-                        kind = "WEB"
-                    ).collect { tok ->
-                        if (tok.text.isNotEmpty()) {
-                            // Cumulative full text from engine — REPLACE, do not append
-                            last = tok.text
+                var finalText = ""
+                app.sourceRouter.chatStream(
+                    messages = hist,
+                    preferredSourceId = if (preferred == "auto") null else preferred,
+                    conversationId = convId
+                ).collect { ev ->
+                    when (ev) {
+                        is SourceRouter.RouteEvent.Delta -> {
                             answering = true
-                            messages = baseline + ChatBubble("user", userText) + ChatBubble("assistant", last)
+                            // Cumulative snapshot — REPLACE the live bubble
+                            messages = baseline + ChatBubble("user", userText) + ChatBubble("assistant", ev.text)
+                        }
+                        is SourceRouter.RouteEvent.Done -> {
+                            finalText = ev.content
+                            replySource = ev.sourceName
+                            replyMs = ev.elapsedMs
                         }
                     }
-                    last.ifBlank { "No reply." }
                 }
 
+                val reply = finalText.ifBlank { "No reply." }
                 messages = baseline + ChatBubble("user", userText) + ChatBubble("assistant", reply)
                 if (!incognito && convId != null) {
                     withContext(Dispatchers.IO) { app.chatRepo.addMessage(convId, "assistant", reply) }
                 }
-                ordered.firstOrNull()?.info?.id?.let { id ->
-                    runCatching { app.soul.learnFromExchange(id, hist, reply, convId) }
+            } catch (e: CancellationException) {
+                val partial = messages.lastOrNull()?.content.orEmpty()
+                if (partial.isBlank()) {
+                    messages = messages.dropLast(1) + ChatBubble("assistant", "Stopped.")
                 }
+                replySource = ""
             } catch (e: Exception) {
                 val err = e.message?.takeIf { it.isNotBlank() } ?: "Something went wrong."
                 messages = baseline + ChatBubble("user", userText) + ChatBubble("assistant", err)
@@ -259,6 +298,7 @@ fun ChatScreen(
                 sending = false
                 answering = false
                 uiLocked = false
+                sendJob = null
             }
         }
     }
@@ -309,7 +349,7 @@ fun ChatScreen(
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             IconButton(onClick = { scope.launch { if (drawerState.isClosed) drawerState.open() else drawerState.close() } }) { Icon(Icons.Default.Menu, "Menu", tint = OmniAmber) }
-                            IconButton(onClick = { toggleIncognito() }) { Icon(Icons.Outlined.VisibilityOff, "Incognito", tint = if (incognito) OmniAmber else MaterialTheme.colorScheme.onSurfaceVariant) }
+                            IconButton(onClick = toggleIncognito) { Icon(Icons.Outlined.VisibilityOff, "Incognito", tint = if (incognito) OmniAmber else MaterialTheme.colorScheme.onSurfaceVariant) }
                             if (incognito) Text("Incognito", style = MaterialTheme.typography.labelMedium, color = OmniAmber)
                         }
                     },
@@ -325,7 +365,14 @@ fun ChatScreen(
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { showAddSheet = true }) { Icon(Icons.Default.Add, "Add", tint = OmniAmber) }
                         OutlinedTextField(value = input, onValueChange = { input = it }, modifier = Modifier.weight(1f), placeholder = { Text(if (incognito) "Incognito message" else "Message") }, shape = RoundedCornerShape(24.dp), maxLines = 4)
-                        IconButton(onClick = { send() }, enabled = !sending) { Icon(if (sending) Icons.Default.HourglassEmpty else Icons.Default.Send, "Send", tint = OmniAmber) }
+                        if (sending) {
+                            // Stop: cancels the relay; partial text stays on screen
+                            IconButton(onClick = { sendJob?.cancel() }) {
+                                Icon(Icons.Default.Stop, "Stop", tint = MaterialTheme.colorScheme.error)
+                            }
+                        } else {
+                            IconButton(onClick = { send() }) { Icon(Icons.Default.Send, "Send", tint = OmniAmber) }
+                        }
                     }
                 }
             }
@@ -363,21 +410,45 @@ fun ChatScreen(
                                     val msg = messages[idx]
                                     val mine = msg.role == "user"
                                     val isLiveAssistant = !mine && idx == messages.lastIndex && sending
-                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
-                                        Surface(shape = RoundedCornerShape(16.dp), color = if (mine) OmniAmber.copy(alpha = 0.25f) else MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.widthIn(max = 320.dp)) {
-                                            Column(Modifier.padding(12.dp)) {
-                                                when {
-                                                    isLiveAssistant && msg.content.isBlank() && !answering -> {
-                                                        BounceDots()
-                                                    }
-                                                    isLiveAssistant && msg.content.isBlank() && answering -> {
-                                                        Text("…", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                                    }
-                                                    else -> {
-                                                        Text(msg.content, style = MaterialTheme.typography.bodyLarge)
+                                    val isErr = !mine && !isLiveAssistant && looksLikeError(msg.content)
+                                    Column(horizontalAlignment = if (mine) Alignment.End else Alignment.Start, modifier = Modifier.fillMaxWidth()) {
+                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+                                            Surface(
+                                                shape = RoundedCornerShape(16.dp),
+                                                color = when {
+                                                    mine -> OmniAmber.copy(alpha = 0.25f)
+                                                    isErr -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
+                                                    else -> MaterialTheme.colorScheme.surfaceVariant
+                                                },
+                                                modifier = Modifier.widthIn(max = 320.dp)
+                                            ) {
+                                                Column(Modifier.padding(12.dp)) {
+                                                    when {
+                                                        isLiveAssistant && msg.content.isBlank() && !answering -> {
+                                                            BounceDots()
+                                                        }
+                                                        isLiveAssistant && msg.content.isBlank() && answering -> {
+                                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                                Text("…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                                Spacer(Modifier.width(6.dp))
+                                                                Text("${elapsedSec}s", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                            }
+                                                        }
+                                                        else -> {
+                                                            Text(msg.content, style = MaterialTheme.typography.bodyLarge)
+                                                        }
                                                     }
                                                 }
                                             }
+                                        }
+                                        // "who answered · how fast" — only on a finished real reply
+                                        if (!mine && !sending && idx == messages.lastIndex && replySource.isNotBlank() && !isErr) {
+                                            Text(
+                                                "via $replySource · ${"%.1f".format(replyMs / 1000f)}s",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(top = 2.dp, start = 6.dp)
+                                            )
                                         }
                                     }
                                 }
@@ -401,13 +472,41 @@ fun ChatScreen(
     }
     if (showProviderSheet) {
         ModalBottomSheet(onDismissRequest = { showProviderSheet = false }) {
-            ListItem(headlineContent = { Text("Auto") }, modifier = Modifier.clickable {
-                preferred = "auto"; ProviderAuthStore.setPreferredProvider(context, "auto"); showProviderSheet = false
-            })
+            ListItem(
+                headlineContent = { Text("Auto — best source, instant fallback") },
+                supportingContent = { Text("Rides the whole relay chain with memory") },
+                leadingContent = { Icon(Icons.Default.AutoAwesome, null, tint = OmniAmber) },
+                modifier = Modifier.clickable {
+                    preferred = "auto"; ProviderAuthStore.setPreferredProvider(context, "auto"); showProviderSheet = false
+                }
+            )
             sources.forEach { s ->
-                ListItem(headlineContent = { Text(s.info.name) }, modifier = Modifier.clickable {
-                    preferred = s.info.id; ProviderAuthStore.setPreferredProvider(context, s.info.id); showProviderSheet = false
-                })
+                val dot = when (s.health()) {
+                    SourceHealth.HEALTHY -> OmniAmber
+                    SourceHealth.AUTH_REQUIRED -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.outline
+                }
+                ListItem(
+                    headlineContent = { Text(s.info.name) },
+                    supportingContent = {
+                        Text(
+                            when (s.health()) {
+                                SourceHealth.HEALTHY -> "Signed in · warm relay"
+                                SourceHealth.AUTH_REQUIRED -> "Sign in required"
+                                SourceHealth.UNKNOWN -> "Guest mode · sign in for your account"
+                                else -> s.info.kind.name.lowercase()
+                            },
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    },
+                    leadingContent = { Box(Modifier.size(8.dp).clip(CircleShape).background(dot)) },
+                    modifier = Modifier.clickable {
+                        preferred = s.info.id
+                        ProviderAuthStore.setPreferredProvider(context, s.info.id)
+                        warmProvider(s.info.id)
+                        showProviderSheet = false
+                    }
+                )
             }
             Spacer(Modifier.height(24.dp))
         }
@@ -436,7 +535,6 @@ fun ChatScreen(
             text = { OutlinedTextField(value = renameText, onValueChange = { renameText = it }, singleLine = true) },
             confirmButton = {
                 TextButton(onClick = {
-                    val id = conversations.find { it.title == renameText || true }?.id
                     scope.launch {
                         currentConvId?.let { cid ->
                             withContext(Dispatchers.IO) { app.chatRepo.renameConversation(cid, renameText) }

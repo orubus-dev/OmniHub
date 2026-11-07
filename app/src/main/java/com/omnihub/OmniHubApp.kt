@@ -1,6 +1,8 @@
 package com.omnihub
 
 import android.app.Application
+import android.os.Handler
+import android.os.Looper
 import com.omnihub.analytics.AnalyticsCollector
 import com.omnihub.analytics.AnalyticsRepository
 import com.omnihub.core.OmniRouter
@@ -15,6 +17,8 @@ import com.omnihub.soul.SoulManager
 import com.omnihub.source.AutoIssueReporter
 import com.omnihub.source.SourceManager
 import com.omnihub.source.SourceRouter
+import com.omnihub.source.core.ProviderAuthStore
+import com.omnihub.source.core.WarmSessionPool
 import com.omnihub.terminal.OmniTerminal
 import com.omnihub.workspace.OmniWorkspace
 
@@ -69,6 +73,20 @@ class OmniHubApp : Application() {
         if (getSharedPreferences("omnihub_localapi", MODE_PRIVATE).getBoolean("enabled", false)) {
             try { startLocalGateway() } catch (_: Exception) { }
         }
+        // Pre-warm the always-usable keyless lane + the user's preferred
+        // provider so the FIRST message skips the 15-30s cold page load.
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                WarmSessionPool.warm(this, "duckduckgo_ai", "https://duck.ai")
+                val preferred = ProviderAuthStore.preferredProvider(this)
+                if (preferred != "auto") {
+                    sourceManager.get(preferred)?.let { src ->
+                        WarmSessionPool.warm(this, src.info.id, src.info.websiteUrl)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }, 1500)
     }
 
     /** Local OpenAI-compatible endpoint over signed-in sources (OmniRoute mode). */

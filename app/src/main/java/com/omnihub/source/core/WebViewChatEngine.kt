@@ -11,28 +11,44 @@ import java.util.UUID
 import kotlin.coroutines.resume
 
 /**
- * WebRelay 1.1.0 — Node-targeted response observation
+ * WebRelay 1.2.0 — Fastlane
  *
- * CRITICAL FIXES (v1.1.0):
- * - No more whole-page innerText delta reconstruction as primary path
- * - Lock onto the newly created assistant message node after submit
- * - Observe only that node (MutationObserver + short poll)
- * - Completion = node text stabilized + !isGenerating
- * - Hard ceiling reduced from 180s → 75s (safety only)
- * - Idle timeout 22s, partial extend 18s
- * - Prefer textContent of the locked node over global heuristics
+ * LATENCY MODEL (why v1.0.9.x could take minutes on one message):
+ * - Kotlin waited only 600ms for a composer before injecting → NO_COMPOSER
+ *   false-fail on any SPA that renders late → router fell through to the next
+ *   provider → another cold load + 22s idle → minutes of cascade.
+ * - The idle timeout started BEFORE the cold page load, so a slow first load
+ *   (15-30s) ate the whole 22s budget → guaranteed fail → cascade.
+ * - Engine failures were sometimes surfaced to the UI as if they were replies.
+ *
+ * v1.2.0 fixes, in the engine:
+ * - The composer wait lives INSIDE the injected script (up to 15s, 120ms poll)
+ *   — a cold load can never false-fail NO_COMPOSER again.
+ * - The idle clock starts at INJECT (page ready), not at send(). Cold loads
+ *   get their own 45s guard.
+ * - At idle-timeout the engine asks the page if it is still generating; if so
+ *   the deadline extends (up to 3 × 20s) instead of failing over.
+ * - React-safe typing (native value setter + execCommand) and send-button
+ *   enablement wait — message submission works across provider frameworks.
+ * - contextPrefix: on a COLD session the previous conversation transcript is
+ *   prefixed to the typed message, so provider switches keep memory.
  */
 object WebViewChatEngine {
 
     data class Result(val text: String, val ok: Boolean, val transactionId: String = "")
 
     private const val TAG = "WEB"
-    /** Quiet with no tokens → fail */
+    /** Quiet with no tokens after inject → ask the page if it is still generating. */
     private const val IDLE_TIMEOUT_MS = 22_000L
     /** Hard ceiling (safety only — normal completion is node stabilization) */
-    private const val ABS_MAX_MS = 75_000L
+    private const val ABS_MAX_MS = 120_000L
     /** Extend deadline this much after each partial */
     private const val PARTIAL_EXTEND_MS = 18_000L
+    /** Extension granted when the page is visibly still generating at idle timeout */
+    private const val GEN_EXTEND_MS = 20_000L
+    private const val MAX_GEN_EXTENSIONS = 3
+    /** Cold page-load guard: page must finish loading within this window */
+    private const val COLD_LOAD_TIMEOUT_MS = 45_000L
 
     fun cleanReply(raw: String, userMessage: String): String? {
         var text = ReplySanitizer.lastTurnOnly(raw, userMessage)
@@ -62,9 +78,10 @@ object WebViewChatEngine {
         providerId: String,
         userMessage: String,
         timeoutMs: Long = IDLE_TIMEOUT_MS,
-        onPartial: (String) -> Unit = {}
+        onPartial: (String) -> Unit = {},
+        contextPrefix: String = ""
     ): Result = ProviderRelayQueue.withProviderLock(providerId) { queueWaitMs ->
-        sendExclusive(context, siteUrl, providerId, userMessage, timeoutMs, queueWaitMs, onPartial)
+        sendExclusive(context, siteUrl, providerId, userMessage, timeoutMs, queueWaitMs, onPartial, contextPrefix)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -75,7 +92,8 @@ object WebViewChatEngine {
         userMessage: String,
         timeoutMs: Long,
         queueWaitMs: Long,
-        onPartial: (String) -> Unit
+        onPartial: (String) -> Unit,
+        contextPrefix: String
     ): Result = suspendCancellableCoroutine { cont ->
         val main = Handler(Looper.getMainLooper())
         val appCtx = context.applicationContext
@@ -101,8 +119,11 @@ object WebViewChatEngine {
             var sendConfirmedAt = 0L
             var lastPartialAt = 0L
             var lastPartialText = ""
+            var genExtensions = 0
+            var coldGuardScheduled = false
 
             lateinit var timeoutRunnable: Runnable
+            lateinit var coldGuardRunnable: Runnable
 
             fun scheduleTimeout(delayMs: Long) {
                 try { main.removeCallbacks(timeoutRunnable) } catch (_: Exception) {}
@@ -121,9 +142,10 @@ object WebViewChatEngine {
                 finished = true
                 session.busy = false
                 try { main.removeCallbacks(timeoutRunnable) } catch (_: Exception) {}
+                try { main.removeCallbacks(coldGuardRunnable) } catch (_: Exception) {}
                 try {
                     web.evaluateJavascript(
-                        "(function(){window.__omniRunning=false;" +
+                        "(function(){window.__omniRunning=false;window.__omniActive=false;" +
                             "if(window.__omniObs){try{window.__omniObs.disconnect()}catch(e){}window.__omniObs=null;}" +
                             "if(window.__omniTimer){clearInterval(window.__omniTimer);window.__omniTimer=null;}" +
                             "window.__omniLockedNode=null;})();",
@@ -140,39 +162,59 @@ object WebViewChatEngine {
                 if (cont.isActive) cont.resume(Result(text, ok, txn))
             }
 
-            timeoutRunnable = Runnable {
-                // Prefer last streamed partial if clean; else page salvage
-                val fromStream = cleanReply(lastPartialText, userMessage)
-                if (fromStream != null && fromStream.length > 20) {
-                    finish(fromStream, true)
-                    return@Runnable
+            // Cold-load guard: cancelled the moment we inject (page ready)
+            coldGuardRunnable = Runnable {
+                if (!injected && !finished) {
+                    Log.i(TAG, "[$txn] COLD_LOAD_TIMEOUT")
+                    finish("COLD_LOAD_TIMEOUT — $providerId took over ${COLD_LOAD_TIMEOUT_MS / 1000}s to load.", false)
                 }
+            }
+
+            timeoutRunnable = Runnable {
+                if (finished) return@Runnable
+                // Ask the page: is the model still writing? If yes, extend instead of failing.
                 web.evaluateJavascript(
-                    """
-                    (function(){
-                      // Prefer locked node if still present
-                      if (window.__omniLockedNode) {
-                        try {
-                          var t = (window.__omniLockedNode.innerText || window.__omniLockedNode.textContent || '').trim();
-                          if (t.length > 8) return t.slice(-12000);
-                        } catch(e){}
-                      }
-                      var root=document.querySelector('main,[role=main],[data-testid*=conversation],#__next')||document.body;
-                      var t=(root&&root.innerText||'').trim();
-                      return t.slice(-12000);
-                    })();
-                    """.trimIndent()
-                ) { last ->
-                    val t = last?.trim()?.removeSurrounding("\"")
-                        ?.replace("\\n", "\n")?.replace("\\\"", "\"")?.trim().orEmpty()
-                    val cleaned = cleanReply(t, userMessage)
-                    if (cleaned != null && cleaned.length > 12) {
-                        finish(cleaned, true)
-                    } else if (lastPartialText.length > 40) {
-                        val soft = ReplySanitizer.strip(lastPartialText)
-                        finish(soft.ifBlank { lastPartialText }, soft.length > 8)
-                    } else {
-                        finish("REPLY_TIMEOUT txn $txn — no clean reply. Stay on signed-in chat and retry.", false)
+                    "(function(){try{return (window.__omniIsGenerating && window.__omniIsGenerating())?'1':'0';}catch(e){return '0';}})();"
+                ) { gen ->
+                    val stillGenerating = gen?.contains("1") == true
+                    if (stillGenerating && genExtensions < MAX_GEN_EXTENSIONS) {
+                        genExtensions++
+                        Log.i(TAG, "[$txn] GEN_EXTEND #$genExtensions (model still writing)")
+                        scheduleTimeout(GEN_EXTEND_MS)
+                        return@evaluateJavascript
+                    }
+                    // Prefer last streamed partial if clean; else page salvage
+                    val fromStream = cleanReply(lastPartialText, userMessage)
+                    if (fromStream != null && fromStream.length > 20) {
+                        finish(fromStream, true)
+                        return@evaluateJavascript
+                    }
+                    web.evaluateJavascript(
+                        """
+                        (function(){
+                          if (window.__omniLockedNode) {
+                            try {
+                              var t = (window.__omniLockedNode.innerText || window.__omniLockedNode.textContent || '').trim();
+                              if (t.length > 8) return t.slice(-12000);
+                            } catch(e){}
+                          }
+                          var root=document.querySelector('main,[role=main],[data-testid*=conversation],#__next')||document.body;
+                          var t=(root&&root.innerText||'').trim();
+                          return t.slice(-12000);
+                        })();
+                        """.trimIndent()
+                    ) { last ->
+                        val t = last?.trim()?.removeSurrounding("\"")
+                            ?.replace("\\n", "\n")?.replace("\\\"", "\"")?.trim().orEmpty()
+                        val cleaned = cleanReply(t, userMessage)
+                        if (cleaned != null && cleaned.length > 12) {
+                            finish(cleaned, true)
+                        } else if (lastPartialText.length > 40) {
+                            val soft = ReplySanitizer.strip(lastPartialText)
+                            finish(soft.ifBlank { lastPartialText }, soft.length > 8)
+                        } else {
+                            finish("REPLY_TIMEOUT txn $txn — no clean reply. Stay on signed-in chat and retry.", false)
+                        }
                     }
                 }
             }
@@ -234,7 +276,7 @@ object WebViewChatEngine {
                 @JavascriptInterface
                 fun onState(state: String) {
                     val now = System.currentTimeMillis()
-                    if (state == "SEND_CONFIRMED" && sendConfirmedAt == 0L) sendConfirmedAt = now
+                    if (state.startsWith("SEND_CONFIRMED") && sendConfirmedAt == 0L) sendConfirmedAt = now
                     Log.i(TAG, "[$txn] $state +${now - t0}ms")
                 }
             }
@@ -247,13 +289,14 @@ object WebViewChatEngine {
                 }
             }
 
-            scheduleTimeout(timeoutMs)
-
             fun inject() {
                 if (finished || injected) return
                 injected = true
+                try { main.removeCallbacks(coldGuardRunnable) } catch (_: Exception) {}
+                // Idle clock starts NOW (page is ready) — never during cold load
+                scheduleTimeout(timeoutMs)
                 web.evaluateJavascript(
-                    "(function(){window.__omniRunning=false;" +
+                    "(function(){window.__omniRunning=false;window.__omniActive=false;" +
                         "if(window.__omniObs){try{window.__omniObs.disconnect()}catch(e){}window.__omniObs=null;}" +
                         "if(window.__omniTimer){clearInterval(window.__omniTimer);window.__omniTimer=null;}" +
                         "window.__omniLockedNode=null;})();",
@@ -264,6 +307,7 @@ object WebViewChatEngine {
                     web.evaluateJavascript(
                         buildEngineScript(
                             userMessage,
+                            contextPrefix,
                             pageMap.composer,
                             pageMap.send,
                             pageMap.conversation,
@@ -272,39 +316,6 @@ object WebViewChatEngine {
                         ),
                         null
                     )
-                }
-            }
-
-            fun waitComposer(attempt: Int) {
-                if (finished || injected) return
-                // Learned map: try inject immediately (ms path)
-                if (mapHot && attempt == 0) {
-                    inject()
-                    return
-                }
-                val cSel = pageMap.composer
-                val learnedBit = if (cSel.isNotBlank())
-                    "try{var le=document.querySelector(${org.json.JSONObject.quote(cSel)});if(le)learned=true;}catch(e){}"
-                else ""
-                web.evaluateJavascript(
-                    "(function(){var learned=false;$learnedBit" +
-                        "var n=document.querySelectorAll('#prompt-textarea,textarea,[contenteditable=true],div[role=textbox],.ProseMirror').length;" +
-                        "var body=(document.body&&document.body.innerText||'').slice(0,900).toLowerCase();" +
-                        "var auth=/sign in to continue|log in to continue|create an account|enter your password/.test(body);" +
-                        "var pw=!!document.querySelector('input[type=password]');" +
-                        "return (learned?1:0)+':'+n+':'+(auth||pw?1:0);})();"
-                ) { s ->
-                    val p = (s ?: "0:0:0").replace("\"", "").trim().split(":")
-                    val learned = p.getOrNull(0)?.toIntOrNull() == 1
-                    val n = p.getOrNull(1)?.toIntOrNull() ?: 0
-                    val auth = p.getOrNull(2)?.toIntOrNull() == 1
-                    if (auth && n == 0 && !learned) {
-                        finish("AUTH_REQUIRED — open provider, sign in, stay on chat box, then retry.", false)
-                        return@evaluateJavascript
-                    }
-                    if (learned || n > 0) inject()
-                    else if (attempt >= 10) inject()
-                    else main.postDelayed({ waitComposer(attempt + 1) }, 60)
                 }
             }
 
@@ -318,15 +329,18 @@ object WebViewChatEngine {
 
             if (session.ready && sameHost && session.lastUrl.isNotBlank()) {
                 Log.i(TAG, "[$txn] HOT_SESSION mapHot=$mapHot")
-                waitComposer(0)
+                inject()
             } else {
                 session.ready = false
                 Log.i(TAG, "[$txn] COLD_LOAD")
+                main.postDelayed(coldGuardRunnable, COLD_LOAD_TIMEOUT_MS)
+                coldGuardScheduled = true
                 web.webViewClient = object : android.webkit.WebViewClient() {
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         session.lastUrl = url.orEmpty()
                         session.ready = true
-                        main.post { waitComposer(0) }
+                        session.observerInstalled = false
+                        main.post { inject() }
                     }
                 }
                 web.loadUrl(target)
@@ -336,6 +350,7 @@ object WebViewChatEngine {
 
     private fun buildEngineScript(
         message: String,
+        contextPrefix: String,
         mapComposer: String,
         mapSend: String,
         mapConv: String,
@@ -343,6 +358,7 @@ object WebViewChatEngine {
         txn: String
     ): String {
         val jsonMsg = org.json.JSONObject.quote(message)
+        val jsonCtx = org.json.JSONObject.quote(contextPrefix)
         val jsonIn = org.json.JSONObject.quote(mapComposer)
         val jsonSend = org.json.JSONObject.quote(mapSend)
         val jsonConv = org.json.JSONObject.quote(mapConv)
@@ -353,8 +369,10 @@ object WebViewChatEngine {
   if (window.__omniObs) { try { window.__omniObs.disconnect(); } catch(e){} window.__omniObs=null; }
   if (window.__omniTimer) { try { clearInterval(window.__omniTimer); } catch(e){} window.__omniTimer=null; }
   window.__omniRunning = true;
+  window.__omniActive = true;
   window.__omniLockedNode = null;
   var MSG = $jsonMsg;
+  var CTX = $jsonCtx;
   var MAP_IN = $jsonIn;
   var MAP_SEND = $jsonSend;
   var MAP_CONV = $jsonConv;
@@ -363,14 +381,14 @@ object WebViewChatEngine {
 
   function state(s){ try{ OmniBridge.onState(s); }catch(e){} }
   function fail(t){
-    window.__omniRunning=false;
+    window.__omniRunning=false; window.__omniActive=false;
     if(window.__omniObs){try{window.__omniObs.disconnect()}catch(e){}window.__omniObs=null;}
     if(window.__omniTimer){clearInterval(window.__omniTimer);window.__omniTimer=null;}
     window.__omniLockedNode=null;
     try{ OmniBridge.onReply('ERR:'+t); }catch(e){}
   }
   function ok(t){
-    window.__omniRunning=false;
+    window.__omniRunning=false; window.__omniActive=false;
     if(window.__omniObs){try{window.__omniObs.disconnect()}catch(e){}window.__omniObs=null;}
     if(window.__omniTimer){clearInterval(window.__omniTimer);window.__omniTimer=null;}
     try{ OmniBridge.onReply(t); }catch(e){}
@@ -393,21 +411,23 @@ object WebViewChatEngine {
     return !!(pw&&visible(pw));
   }
 
+  // Tightened generation detection. No [class*="stop"] catch-all — it matched
+  // unrelated elements and froze the completion gate on several providers.
   function isGenerating(){
     var sels=[
       'button[aria-label*="Stop" i]','button[data-testid*="stop"]','[data-testid="stop-button"]',
-      'button[aria-label*="Stop generating" i]','.result-streaming','.streaming',
-      'button[aria-label*="Stop" i] svg', '[class*="stop"]'
+      'button[aria-label*="Stop generating" i]','.result-streaming','.streaming','[aria-busy="true"]'
     ];
     for(var i=0;i<sels.length;i++){
       try{ var n=document.querySelectorAll(sels[i]); for(var j=0;j<n.length;j++) if(visible(n[j])) return true; }catch(e){}
     }
     try{
       var t=(document.body&&document.body.innerText||'').slice(-600).toLowerCase();
-      if(/stop generating|generating…|generating\\.\\.\\.|thinking…|thinking\\.\\.\\./.test(t)) return true;
+      if(/stop generating|generating…|generating\.\.\.|thinking…|thinking\.\.\./.test(t)) return true;
     }catch(e){}
     return false;
   }
+  window.__omniIsGenerating = isGenerating;
 
   function cssPath(el){
     if(!el||el.nodeType!==1) return '';
@@ -427,10 +447,7 @@ object WebViewChatEngine {
     return parts.join(' > ');
   }
 
-  // ========== IMPROVED LOCATORS ==========
-
   function findComposer(){
-    // Prefer learned selector
     if(MAP_IN){
       try{ var el=document.querySelector(MAP_IN); if(el&&visible(el)) return el; }catch(e){}
     }
@@ -457,7 +474,7 @@ object WebViewChatEngine {
     }
     var sels = [
       'button[data-testid*="send"]','button[aria-label*="Send" i]','button[aria-label*="Submit" i]',
-      'button[type="submit"]','[data-testid="send-button"]','button:has(svg)'
+      'button[type="submit"]','[data-testid="send-button"]'
     ];
     var candidates=[];
     for(var i=0;i<sels.length;i++){
@@ -475,7 +492,6 @@ object WebViewChatEngine {
     return candidates[0]||null;
   }
 
-  // Core improvement: locate the *latest* assistant message node
   function locateLatestAssistant(){
     var sels = [
       '[data-message-author-role="assistant"]',
@@ -501,36 +517,57 @@ object WebViewChatEngine {
       }catch(e){}
     }
     if(nodes.length===0) return null;
-    // Prefer the last one in document order (newest)
     return nodes[nodes.length-1];
   }
 
   function getNodeText(node){
     if(!node) return '';
     try{
-      // Prefer textContent for speed; fall back to innerText
       var t = (node.textContent || node.innerText || '').trim();
       return t;
     }catch(e){ return ''; }
   }
 
-  // ========== SUBMIT PATH ==========
+  // React-safe value setter — plain el.value= is ignored by React-controlled
+  // inputs (send button never enables → SEND_FAILED → cascade).
+  function setNativeValue(el, text){
+    try{
+      var proto = el.tagName==='TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+      var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if(desc && desc.set){ desc.set.call(el, text); } else { el.value = text; }
+      el.dispatchEvent(new Event('input',{bubbles:true}));
+      el.dispatchEvent(new Event('change',{bubbles:true}));
+    }catch(e){
+      try{ el.value = text; el.dispatchEvent(new Event('input',{bubbles:true})); }catch(e2){}
+    }
+  }
 
   function setInputValue(el, text){
     if(!el) return false;
     try{
       el.focus();
       if(el.tagName==='TEXTAREA' || el.tagName==='INPUT'){
-        el.value = text;
-        el.dispatchEvent(new Event('input',{bubbles:true}));
-        el.dispatchEvent(new Event('change',{bubbles:true}));
+        setNativeValue(el, text);
         return true;
       }
-      // contenteditable / ProseMirror
+      // contenteditable / ProseMirror — execCommand fires trusted input events
+      try{
+        var range=document.createRange(); range.selectNodeContents(el);
+        var sel=window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+        var okExec = document.execCommand('insertText', false, text);
+        if(okExec && (el.textContent||'').length>0) return true;
+      }catch(eInner){}
       el.innerHTML = '';
       el.textContent = text;
       el.dispatchEvent(new InputEvent('input',{bubbles:true,data:text,inputType:'insertText'}));
       return true;
+    }catch(e){ return false; }
+  }
+
+  function inputIsEmpty(el){
+    try{
+      if(el.tagName==='TEXTAREA' || el.tagName==='INPUT') return (el.value||'').length===0;
+      return (el.textContent||'').trim().length===0;
     }catch(e){ return false; }
   }
 
@@ -548,89 +585,129 @@ object WebViewChatEngine {
     }
   }
 
-  function confirmSend(cb){
-    var tries=0;
-    function check(){
-      tries++;
-      // Heuristic: either generating started or a new assistant node appeared
-      if(isGenerating() || locateLatestAssistant()){
-        state('SEND_CONFIRMED');
-        cb(true);
-        return;
-      }
-      if(tries>25){ cb(false); return; }
-      setTimeout(check, 80);
-    }
-    setTimeout(check, 120);
+  function pressEnter(el){
+    try{
+      ['keydown','keypress','keyup'].forEach(function(type){
+        el.dispatchEvent(new KeyboardEvent(type,{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true}));
+      });
+      return true;
+    }catch(e){ return false; }
   }
 
   // ========== MAIN FLOW ==========
+  // Everything below is time-bounded INSIDE the page: no more Kotlin-side
+  // 600ms composer wait → NO_COMPOSER false-fails are gone.
 
-  if(needsAuth()){
-    fail('AUTH_REQUIRED — open provider, sign in, stay on chat box, then retry.');
-    return;
-  }
+  var t0 = Date.now();
+  var input=null, lastSend=null;
+  var beforeAssistants=[];
 
-  var input = findComposer();
-  if(!input){
-    fail('NO_COMPOSER — could not locate chat input.');
-    return;
-  }
-
-  if(!setInputValue(input, MSG)){
-    fail('INPUT_FAILED — could not set message text.');
-    return;
-  }
-
-  var lastSend = findSendButton(input);
-  if(!lastSend){
-    // Try Enter key as fallback
+  function snapshotAssistants(){
+    beforeAssistants=[];
     try{
-      input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}));
+      var existing = document.querySelectorAll(
+        '[data-message-author-role="assistant"],[data-role="assistant"],[data-testid*="assistant"],.markdown.prose,.prose'
+      );
+      for(var i=0;i<existing.length;i++) beforeAssistants.push(existing[i]);
     }catch(e){}
-  } else {
-    if(!clickSend(lastSend)){
-      fail('SEND_CLICK_FAILED');
+  }
+
+  function waitComposer(){
+    input = findComposer();
+    if(input){
+      state('COMPOSER_FOUND +' + (Date.now()-t0) + 'ms');
+      return typeAndSend();
+    }
+    // Auth wall with no composer anywhere → fail fast, do not burn the budget
+    if(Date.now()-t0 > 4000 && needsAuth()){
+      fail('AUTH_REQUIRED — open provider, sign in, stay on chat box, then retry.');
       return;
     }
+    if(Date.now()-t0 > 15000){
+      fail('NO_COMPOSER — could not locate chat input within 15s.');
+      return;
+    }
+    setTimeout(waitComposer, 120);
   }
 
-  // Snapshot existing assistant nodes BEFORE waiting for the new one
-  var beforeAssistants = [];
-  try{
-    var existing = document.querySelectorAll(
-      '[data-message-author-role="assistant"],[data-role="assistant"],[data-testid*="assistant"],.markdown.prose,.prose'
-    );
-    for(var i=0;i<existing.length;i++) beforeAssistants.push(existing[i]);
-  }catch(e){}
+  function typeAndSend(){
+    // Continuity: on a cold session the earlier thread is prefixed so the
+    // provider keeps the memory of the conversation it never saw.
+    setInputValue(input, CTX ? (CTX + '\n' + '\n' + MSG) : MSG);
+    state('TYPED');
 
-  confirmSend(function(sent){
-    if(!sent){
+    snapshotAssistants();
+
+    // Wait briefly for the send button to enable (frameworks render it after
+    // the value settles), then click; Enter as fallback.
+    var sendTries=0;
+    function waitSend(){
+      sendTries++;
+      lastSend = findSendButton(input);
+      var disabled = false;
+      try{ disabled = lastSend && (lastSend.disabled || lastSend.getAttribute('aria-disabled')==='true'); }catch(e){}
+      if(lastSend && !disabled){
+        clickSend(lastSend) || pressEnter(input);
+        state('SENT');
+        confirmSend(0);
+        return;
+      }
+      if(sendTries > 25){
+        // Send button never enabled — still try: Enter path works on many UIs
+        pressEnter(input);
+        state('SENT_ENTER_FALLBACK');
+        confirmSend(0);
+        return;
+      }
+      setTimeout(waitSend, 100);
+    }
+    setTimeout(waitSend, 120);
+  }
+
+  function confirmSend(tries){
+    // Send confirmed when: generating started, OR a new assistant node appeared,
+    // OR the composer cleared (universal signal), OR the learned map already works.
+    var cleared=false;
+    try{ cleared = input && inputIsEmpty(input); }catch(e){}
+    if(isGenerating() || locateLatestAssistant() !== snapshotHit() || cleared){
+      state('SEND_CONFIRMED +' + (Date.now()-t0) + 'ms');
+      observe();
+      return;
+    }
+    if(tries===30){
+      // One last nudge: re-click, then give up after the extra window
+      clickSend(lastSend);
+      setTimeout(function(){ confirmSend(31); }, 400);
+      return;
+    }
+    if(tries>30){
       fail('SEND_FAILED — message not submitted. Stay on signed-in chat UI and retry.');
       return;
     }
+    setTimeout(function(){ confirmSend(tries+1); }, 100);
+  }
 
+  function snapshotHit(){
+    // The assistant node that existed BEFORE submit (so we can tell new from old)
+    return beforeAssistants.length ? beforeAssistants[beforeAssistants.length-1] : null;
+  }
+
+  function observe(){
     state('THINKING');
     var lastEmitted = '';
     var quietTicks = 0;
     var grew = false;
-    var tStart = Date.now();
     var lockedNode = null;
     var lockAttempts = 0;
 
     function tryLockNode(){
-      // Look for a new assistant node that wasn't present before submit
       var current = locateLatestAssistant();
       if(!current) return null;
-      // Prefer nodes that are not in the before snapshot
       var isNew = true;
       for(var i=0;i<beforeAssistants.length;i++){
         if(beforeAssistants[i] === current){ isNew=false; break; }
       }
-      if(isNew || beforeAssistants.length===0){
-        return current;
-      }
-      // Fallback: if the last one grew significantly, lock it
+      if(isNew || beforeAssistants.length===0) return current;
       var txt = getNodeText(current);
       if(txt.length > 20) return current;
       return null;
@@ -639,15 +716,13 @@ object WebViewChatEngine {
     function tick(){
       if(!window.__omniRunning) return true;
 
-      // Phase 1: lock onto the response node
       if(!lockedNode){
         lockAttempts++;
         lockedNode = tryLockNode();
         if(lockedNode){
           window.__omniLockedNode = lockedNode;
-          state('LOCKED');
-        } else if(lockAttempts > 40){ // ~3.2s of trying
-          // Fallback to last assistant even if not "new"
+          state('LOCKED +' + (Date.now()-t0) + 'ms');
+        } else if(lockAttempts > 40){
           lockedNode = locateLatestAssistant();
           if(lockedNode) window.__omniLockedNode = lockedNode;
         }
@@ -657,7 +732,6 @@ object WebViewChatEngine {
       if(lockedNode){
         d = getNodeText(lockedNode);
       } else {
-        // Temporary fallback while waiting for node
         var tmp = locateLatestAssistant();
         if(tmp) d = getNodeText(tmp);
       }
@@ -674,22 +748,18 @@ object WebViewChatEngine {
 
       var gen = isGenerating();
 
-      // Completion criteria (much tighter than before)
-      // - We have a locked (or latest) node with text
-      // - Text stopped changing for a few ticks
-      // - Provider is no longer generating
       var needQuiet = d.length > 1500 ? 6 : 4; // ~320-480ms at 80ms poll
       if(grew && quietTicks >= needQuiet && !gen && d.length >= 3){
         state('COMPLETED');
-        learn(cssPath(input), cssPath(lastSend), '');
+        learn(cssPath(input), cssPath(lastSend), MAP_CONV);
         ok(d || lastEmitted);
         return true;
       }
 
-      // Early exit if we somehow got a very long stable reply and no generation signal
-      if(grew && quietTicks >= 10 && d.length > 80 && !gen){
+      // Long stable reply — completes even if the gen signal is stuck true
+      if(grew && quietTicks >= 10 && d.length > 80){
         state('COMPLETED_STABLE');
-        learn(cssPath(input), cssPath(lastSend), '');
+        learn(cssPath(input), cssPath(lastSend), MAP_CONV);
         ok(d || lastEmitted);
         return true;
       }
@@ -697,30 +767,33 @@ object WebViewChatEngine {
       return false;
     }
 
-    // Observe the conversation root, but we only *read* the locked node
     try{
       var root = document.querySelector('main,[role=main],[data-testid*=conversation],#__next') || document.body;
       window.__omniObs = new MutationObserver(function(){ tick(); });
       window.__omniObs.observe(root, {childList:true, subtree:true, characterData:true});
     }catch(e){}
 
-    // 80ms poll is kept for reliability, but work is now cheap (node text only)
     window.__omniTimer = setInterval(function(){
       if(tick()) return;
-      // Safety ceiling — 70 seconds (well under Kotlin 75s)
-      if(Date.now() - tStart > 70000){
+      if(Date.now() - t0 > 110000){
         clearInterval(window.__omniTimer); window.__omniTimer=null;
         if(window.__omniObs){try{window.__omniObs.disconnect()}catch(e){}window.__omniObs=null;}
         var finalD = lockedNode ? getNodeText(lockedNode) : (lastEmitted || '');
         if(finalD.length >= 8 || lastEmitted.length >= 8){
-          learn(cssPath(input), cssPath(lastSend), '');
+          learn(cssPath(input), cssPath(lastSend), MAP_CONV);
           ok(finalD || lastEmitted);
         } else {
           fail('REPLY_TIMEOUT txn '+TXN);
         }
       }
     }, 80);
-  });
+  }
+
+  if(needsAuth() && !findComposer()){
+    fail('AUTH_REQUIRED — open provider, sign in, stay on chat box, then retry.');
+    return;
+  }
+  waitComposer();
 })();
         """.trimIndent()
     }

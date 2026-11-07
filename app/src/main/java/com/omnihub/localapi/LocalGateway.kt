@@ -3,6 +3,7 @@ package com.omnihub.localapi
 import com.omnihub.OmniHubApp
 import com.omnihub.providers.ChatMessage
 import com.omnihub.source.SourceChatRequest
+import com.omnihub.source.SourceRouter
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,6 +28,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * "chatgpt_web/gpt-5"). "auto" routes through SourceRouter with soul memory
  * injected, so any OpenAI-speaking client (Termux CLI, aider, your own app,
  * another AI app on the phone) rides the signed-in web AIs.
+ *
+ * stream:true emits REAL incremental deltas — as the WebView page writes the
+ * reply, tokens flow out of the SSE pipe; nothing waits for full completion.
  */
 class LocalGateway(
     private val app: OmniHubApp,
@@ -142,38 +146,97 @@ class LocalGateway(
             return ok(out)
         }
 
-        // SSE streaming (v1: full reply in one delta — web relays complete server-side)
+        // SSE with real incremental deltas: cumulative snapshots from the relay
+        // are converted to OpenAI-style diffs and flushed as they arrive.
         val pos = PipedOutputStream()
         val pis = PipedInputStream(pos, 64 * 1024)
         scope.launch {
             try {
-                try {
-                    val (content, usedModel) = runCompletion(modelId, messages)
-                    val chunk = JSONObject()
+                var sentLen = 0
+                var usedModel = modelId
+
+                fun chunk(deltaContent: String?, finishReason: String?): String {
+                    val delta = JSONObject()
+                    if (deltaContent != null) delta.put("content", deltaContent)
+                    if (sentLen == 0 && deltaContent != null) delta.put("role", "assistant")
+                    val choice = JSONObject()
+                        .put("index", 0)
+                        .put("delta", delta)
+                    if (finishReason != null) choice.put("finish_reason", finishReason)
+                    return "data: " + JSONObject()
                         .put("id", completionId)
                         .put("object", "chat.completion.chunk")
                         .put("created", created)
                         .put("model", usedModel)
-                        .put(
-                            "choices", JSONArray().put(
-                                JSONObject()
-                                    .put("index", 0)
-                                    .put("delta", JSONObject().put("content", content))
-                                    .put("finish_reason", "stop")
-                            )
-                        )
-                    pos.write("data: $chunk\n\n".toByteArray())
-                    pos.flush()
-                } finally {
-                    pos.write("data: [DONE]\n\n".toByteArray())
-                    pos.flush()
-                    pos.close()
+                        .put("choices", JSONArray().put(choice))
+                        .toString() + "\n\n"
                 }
-            } catch (_: Exception) {
+
+                pos.write(chunk(null, null).toByteArray()) // role-only first chunk
+                pos.flush()
+
+                val events: kotlinx.coroutines.flow.Flow<Any> = if (modelId.indexOf('/') > 0) {
+                    val sid = modelId.substring(0, modelId.indexOf('/'))
+                    val mid = modelId.substring(modelId.indexOf('/') + 1)
+                    val src = app.sourceManager.get(sid)
+                        ?: throw IllegalStateException("source '$sid' is not installed — install it in the Store and sign in")
+                    src.stream(SourceChatRequest(messages = messages, model = mid)).let { f ->
+                        kotlinx.coroutines.flow.flow {
+                            f.collect { emit(it as Any) }
+                            emit(SourceRouter.RouteEvent.Done("", sid, src.info.name, 0))
+                        }
+                    }
+                } else {
+                    app.sourceRouter.chatStream(messages)
+                }
+
+                events.collect { ev ->
+                    when (ev) {
+                        is SourceRouter.RouteEvent.Delta -> {
+                            usedModel = "${ev.sourceId}"
+                            if (ev.text.length > sentLen) {
+                                val piece = ev.text.substring(sentLen)
+                                sentLen = ev.text.length
+                                pos.write(chunk(piece, null).toByteArray())
+                                pos.flush()
+                            } else if (ev.text.length < sentLen) {
+                                // Snapshot shrank (sanitizer) — resend whole body as one delta
+                                val piece = "\u200b" + ev.text
+                                sentLen = ev.text.length
+                                pos.write(chunk(piece, null).toByteArray())
+                                pos.flush()
+                            }
+                        }
+                        is SourceRouter.RouteEvent.Done -> {
+                            val full = ev.content.ifBlank { "" }
+                            if (full.length > sentLen) {
+                                val piece = full.substring(sentLen)
+                                sentLen = full.length
+                                pos.write(chunk(piece, null).toByteArray())
+                            }
+                            usedModel = if (ev.sourceName.isBlank()) usedModel else "${ev.sourceId}"
+                            pos.write(chunk(null, "stop").toByteArray())
+                        }
+                    }
+                }
+                pos.write("data: [DONE]\n\n".toByteArray())
+                pos.flush()
+            } catch (e: Exception) {
+                try {
+                    val err = JSONObject()
+                        .put("error", JSONObject().put("message", e.message ?: "gateway stream error"))
+                    pos.write("data: $err\n\n".toByteArray())
+                } catch (_: Exception) {}
+            } finally {
+                try { pos.write("data: [DONE]\n\n".toByteArray()) } catch (_: Exception) {}
+                try { pos.flush() } catch (_: Exception) {}
                 try { pos.close() } catch (_: Exception) {}
             }
         }
-        return newChunkedResponse(Response.Status.OK, "text/event-stream", pis)
+        val resp = newChunkedResponse(Response.Status.OK, "text/event-stream", pis)
+        resp.addHeader("X-Accel-Buffering", "no")
+        resp.addHeader("Cache-Control", "no-cache")
+        return resp
     }
 
     /**

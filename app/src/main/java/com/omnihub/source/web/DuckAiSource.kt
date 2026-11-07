@@ -10,7 +10,15 @@ import com.omnihub.source.SourceChatRequest
 import com.omnihub.source.SourceHealth
 import com.omnihub.source.SourceInfo
 import com.omnihub.source.SourceKind
+import com.omnihub.source.core.ProviderBridge
 import com.omnihub.source.core.WebViewChatEngine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 
 /**
  * Duck.ai as a first-class source — the OmniHub way.
@@ -36,13 +44,13 @@ class DuckAiSource(private val context: Context) : AiSource {
         authType = AuthType.NONE,
         description = "DuckDuckGo AI chat in a real WebView. Free GPT, Claude Haiku and Llama-class models, no account, no API key. The page runs its own signals — OmniHub just drives it.",
         websiteUrl = "https://duck.ai",
-        revision = "1.1.0",
+        revision = "1.2.0",
         category = "ai",
         bundled = true,
         updatePolicy = com.omnihub.source.UpdatePolicy.STARTUP,
         capabilities = SourceCapabilities(
             chat = true,
-            stream = false,
+            stream = true,
             vision = false,
             tools = false,
             research = true
@@ -60,25 +68,30 @@ class DuckAiSource(private val context: Context) : AiSource {
 
     override fun health(): SourceHealth = SourceHealth.HEALTHY
 
-    override suspend fun chat(request: SourceChatRequest): ChatResponse {
+    private fun promptOf(request: SourceChatRequest): Pair<String, String> {
         val prompt = request.messages.lastOrNull { it.role == "user" }?.content
             ?: throw IllegalStateException("no user message")
+        // Memory continuity on provider switch: the transcript rides as
+        // contextPrefix — the engine types it in ONLY on a cold session, so a
+        // warm duck.ai thread is never duplicated.
+        val prefix = when {
+            request.messages.size > 1 -> ProviderBridge.contextPrefixFor(request.messages, request.memoryContext)
+            !request.memoryContext.isNullOrBlank() ->
+                "Context about the user and this conversation (memory):\n${request.memoryContext}"
+            else -> ""
+        }
+        return prompt to prefix
+    }
 
-        // Memory continuity: when switching providers mid-conversation the soul
-        // context is carried inside the request by SourceRouter. For direct
-        // gateway calls we prepend a compact transcript so duck knows the thread.
-        val promptWithThread = if (request.messages.size > 1 && request.memoryContext.isNullOrBlank()) {
-            val transcript = request.messages.dropLast(1)
-                .joinToString("\n") { "${if (it.role == "user") "User" else "Assistant"}: ${it.content}" }
-            if (transcript.length < 8000) "Conversation so far:\n$transcript\n\nUser: $prompt" else prompt
-        } else prompt
-
+    override suspend fun chat(request: SourceChatRequest): ChatResponse {
+        val (prompt, prefix) = promptOf(request)
         val result = WebViewChatEngine.send(
             context = context,
             siteUrl = "https://duck.ai",
             providerId = "duckduckgo_ai",
-            userMessage = promptWithThread,
-            timeoutMs = 75_000
+            userMessage = prompt,
+            timeoutMs = 75_000,
+            contextPrefix = prefix
         )
         if (!result.ok) throw IllegalStateException(result.text.ifBlank { "duck.ai relay failed" })
         val text = result.text.trim()
@@ -89,4 +102,28 @@ class DuckAiSource(private val context: Context) : AiSource {
             providerId = info.id
         )
     }
+
+    /** True streaming: cumulative node text flows out as the page writes it. */
+    override fun stream(request: SourceChatRequest): Flow<String> = channelFlow {
+        val (prompt, prefix) = promptOf(request)
+        val job = launch(Dispatchers.IO) {
+            try {
+                val result = WebViewChatEngine.send(
+                    context = context,
+                    siteUrl = "https://duck.ai",
+                    providerId = "duckduckgo_ai",
+                    userMessage = prompt,
+                    timeoutMs = 75_000,
+                    contextPrefix = prefix,
+                    onPartial = { p -> trySend(p) }
+                )
+                if (!result.ok) throw IllegalStateException(result.text.ifBlank { "duck.ai relay failed" })
+                trySend(result.text.trim())
+                close()
+            } catch (e: Exception) {
+                close(e)
+            }
+        }
+        awaitClose { job.cancel() }
+    }.flowOn(Dispatchers.IO)
 }
