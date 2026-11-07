@@ -141,11 +141,26 @@ jobs:
             App versionName: **${{ steps.ver.outputs.version }}**
             Channel: **${{ steps.meta.outputs.channel }}**
 
-            ### 1.0.9.8 — accuracy + speed
-            - Last-turn extract, chrome/disclaimer strip
-            - Suppress partial user-echo
-            - Hard stop 60s
-            - Universal WebRelay path
+            ### 1.1.0 — Fastlane: the 4-minute relay is dead
+            - Composer wait moved inside the page (15s budget) — cold loads no
+              longer false-fail and cascade across providers
+            - Idle clock starts when the page is ready; still-generating pages
+              extend the deadline instead of failing over mid-thought
+            - React-safe typing + send-button enablement wait — submission works
+              across provider UIs, not just ChatGPT-style DOMs
+            - True streaming: partials flow from every provider into the chat
+              bubble live; stop button; "via provider · Xs" on every reply
+            - Fallback bounded (max 4 providers) and failures are never shown
+              as AI replies anymore
+            - Memory across providers: switching providers carries the thread
+              (typed in on cold sessions only)
+            - Warm sessions: duck.ai + your preferred provider pre-load at app
+              start — first message skips the cold load
+            - Local Gateway (Settings → OmniRoute mode): your signed-in
+              providers become an OpenAI-compatible local endpoint with real
+              incremental SSE deltas
+            - CI fixed: builds were dead since September (removed 'tools' SDK
+              package) — this is the first working build since
 
             Install the APK attached to this release.
           files: ${{ steps.meta.outputs.apk }}
