@@ -1,5 +1,6 @@
 package com.omnihub.ui.screens
 
+import android.content.Context
 import android.content.Intent
 import android.provider.Settings
 import android.widget.Toast
@@ -20,6 +21,7 @@ import com.omnihub.BuildConfig
 import com.omnihub.OmniHubApp
 import com.omnihub.data.SecureStore
 import com.omnihub.data.UserPrefs
+import com.omnihub.localapi.LocalGateway
 import com.omnihub.source.extension.ApkInstaller
 import com.omnihub.update.AppUpdateChecker
 import kotlinx.coroutines.Dispatchers
@@ -149,6 +151,48 @@ fun SettingsScreen(
                 leadingContent = { Icon(Icons.Default.Extension, null) },
                 trailingContent = { Icon(Icons.Default.ChevronRight, null) },
                 modifier = Modifier.clickable { onOpenConnectors() }
+            )
+
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            Text("Local Gateway (OmniRoute mode)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            var gatewayOn by remember { mutableStateOf(LocalGateway.running.get()) }
+            var gatewayLan by remember { mutableStateOf(LocalGateway.lanEnabled) }
+            ListItem(
+                headlineContent = { Text("OpenAI-compatible endpoint") },
+                supportingContent = {
+                    Text(
+                        if (gatewayOn)
+                            "Running · http://127.0.0.1:8099/v1 — Termux, aider or any OpenAI client on this phone rides your signed-in providers. No keys."
+                        else
+                            "Off — turns every provider you signed into into a local /v1 API. No API keys involved."
+                    )
+                },
+                leadingContent = { Icon(Icons.Default.Lan, null) },
+                trailingContent = {
+                    Switch(checked = gatewayOn, onCheckedChange = { on ->
+                        gatewayOn = on
+                        context.getSharedPreferences("omnihub_localapi", Context.MODE_PRIVATE)
+                            .edit().putBoolean("enabled", on).apply()
+                        try {
+                            if (on) app.startLocalGateway() else app.stopLocalGateway()
+                        } catch (e: Exception) {
+                            status = e.message
+                        }
+                    })
+                }
+            )
+            ListItem(
+                headlineContent = { Text("Expose on LAN") },
+                supportingContent = { Text("Other devices on your Wi-Fi can use the endpoint. Applies on next start.") },
+                leadingContent = { Icon(Icons.Default.Wifi, null) },
+                trailingContent = {
+                    Switch(checked = gatewayLan, onCheckedChange = { on ->
+                        gatewayLan = on
+                        LocalGateway.lanEnabled = on
+                        context.getSharedPreferences("omnihub_localapi", Context.MODE_PRIVATE)
+                            .edit().putBoolean("lan", on).apply()
+                    })
+                }
             )
 
             HorizontalDivider(Modifier.padding(vertical = 8.dp))

@@ -92,6 +92,8 @@ class OmniHubApp : Application() {
     /** Local OpenAI-compatible endpoint over signed-in sources (OmniRoute mode). */
     fun startLocalGateway(port: Int = LocalGateway.DEFAULT_PORT) {
         if (LocalGateway.running.get()) return
+        LocalGateway.lanEnabled = getSharedPreferences("omnihub_localapi", MODE_PRIVATE)
+            .getBoolean("lan", false)
         localGateway = LocalGateway(this, port).also { it.startGateway() }
     }
 
