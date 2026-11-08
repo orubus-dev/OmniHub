@@ -60,11 +60,27 @@ jobs:
             'distributionBase=GRADLE_USER_HOME' \
             'distributionPath=wrapper/dists' \
             'distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip' \
-            'networkTimeout=10000' \
+            'networkTimeout=60000' \
             'validateDistributionUrl=true' \
             'zipStoreBase=GRADLE_USER_HOME' \
             'zipStorePath=wrapper/dists' \
             > gradle/wrapper/gradle-wrapper.properties
+
+      - name: Prime Gradle distribution (retry — services.gradle.org stalls on new runner images)
+        run: |
+          set -e
+          ok=0
+          for i in 1 2 3 4 5; do
+            if ./gradlew --version > /tmp/gradle_ver.log 2>&1; then
+              ok=1
+              echo "gradle ready on attempt $i"
+              break
+            fi
+            echo "attempt $i failed:"; tail -5 /tmp/gradle_ver.log || true
+            rm -rf ~/.gradle/wrapper/dists
+            sleep 20
+          done
+          [ "$ok" = "1" ] || { echo "Gradle distribution unreachable after 5 attempts"; exit 1; }
 
       - name: Decode Keystore
         env:
@@ -115,7 +131,18 @@ jobs:
       - name: Build Release APK
         run: |
           set -o pipefail
-          ./gradlew clean assembleRelease --stacktrace 2>&1 | tee build.log
+          ok=0
+          for i in 1 2 3; do
+            if ./gradlew clean assembleRelease --stacktrace 2>&1 | tee build.log; then
+              ok=1; break
+            fi
+            # Retry only infra-shaped failures (wrapper/network), not compile errors
+            if grep -qE "SocketTimeout|UnknownHostException|Install.forceFetch|Connection reset" build.log; then
+              echo "infra failure on attempt $i — retrying"; sleep 20; continue
+            fi
+            break
+          done
+          [ "$ok" = "1" ] || { tail -80 build.log; exit 1; }
           APK=$(find app/build/outputs/apk -type f -name "*.apk" | head -n 1)
           test -n "$APK"
           SIZE=$(wc -c < "$APK")
