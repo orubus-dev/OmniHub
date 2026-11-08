@@ -6,6 +6,9 @@ import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.GeolocationPermissions
+import android.webkit.PermissionRequest
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -94,6 +97,22 @@ object WarmSessionPool {
                 session.lastUrl = url.orEmpty()
                 session.ready = true
                 session.observerInstalled = false
+            }
+        }
+        // Silent automation client: the relay never needs location, camera,
+        // mic or any runtime permission. Denying at the bridge level kills
+        // popups like duck.ai's "Share your precise location" before they can
+        // block a transaction — no per-site hacks, no dialog clicking.
+        web.webChromeClient = object : WebChromeClient() {
+            override fun onGeolocationPermissionsShowPrompt(
+                origin: String?,
+                callback: GeolocationPermissions.Callback?
+            ) {
+                callback?.invoke(origin, false, false)
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                request?.deny()
             }
         }
         sessions[providerId] = session

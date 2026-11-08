@@ -141,26 +141,37 @@ jobs:
             App versionName: **${{ steps.ver.outputs.version }}**
             Channel: **${{ steps.meta.outputs.channel }}**
 
-            ### 1.1.0 — Fastlane: the 4-minute relay is dead
-            - Composer wait moved inside the page (15s budget) — cold loads no
-              longer false-fail and cascade across providers
-            - Idle clock starts when the page is ready; still-generating pages
-              extend the deadline instead of failing over mid-thought
-            - React-safe typing + send-button enablement wait — submission works
-              across provider UIs, not just ChatGPT-style DOMs
-            - True streaming: partials flow from every provider into the chat
-              bubble live; stop button; "via provider · Xs" on every reply
-            - Fallback bounded (max 4 providers) and failures are never shown
-              as AI replies anymore
-            - Memory across providers: switching providers carries the thread
-              (typed in on cold sessions only)
-            - Warm sessions: duck.ai + your preferred provider pre-load at app
-              start — first message skips the cold load
-            - Local Gateway (Settings → OmniRoute mode): your signed-in
-              providers become an OpenAI-compatible local endpoint with real
-              incremental SSE deltas
-            - CI fixed: builds were dead since September (removed 'tools' SDK
-              package) — this is the first working build since
+            ### 1.1.0.1 — Accuracy: duck.ai is now a real endpoint, the composer mess is gone
+            - **duck.ai API lane**: the warm duck.ai WebView now calls
+              duckchat/v1/status → solves the challenge in its own real browser
+              runtime → streams duckchat/v1/chat SSE. Real multi-turn (no more
+              context-prefix typing on duck), real model selection
+              (gpt-5.4-mini / claude-haiku-4-5 / gpt-6-luna / gpt-oss-120b),
+              first token in ~2-6s. The orubus-ai route-d technique, fused with
+              WarmSessionPool — the browser IS the solver. Composer relay stays
+              as automatic fallback.
+            - **No more word bans**: the chrome-phrase blocklist that deleted
+              real answers (and faked REPLY_TIMEOUTs) is gone. Chrome is
+              removed structurally — the reply node is cloned and its buttons,
+              toolbars, footers and disclaimers are stripped by DOM before
+              text is read. A visible answer can no longer become an error.
+            - **Transcript-delta fallback**: providers with no recognizable
+              reply nodes (Meta AI family) now complete via a before/after
+              snapshot diff of the conversation region.
+            - **Submission ladder**: typed text is read back from the field
+              before submit (kills "stuck in the composer"), then send click →
+              Enter → form-submit, each verified by progress signals, 3
+              rounds. Failed sends clear the composer — nothing sticks around.
+            - **Popups die at the bridge**: geolocation and runtime permission
+              prompts are denied in the WebView chrome client (the duck.ai
+              "Share your precise location" wall is gone).
+            - **Memory rebuilt at the root**: soul memory distills from the
+              user's turns only — AI prose (stories, roleplay) can never
+              pollute memory again. Legacy polluted units are migrated away on
+              first launch; memory context hard-capped at 700 chars.
+            - **Speed**: observation starts at submit, polls tightened to
+              60ms, lean context prefix (~1600 chars max), completion
+              quiet-window ~300ms.
 
             Install the APK attached to this release.
           files: ${{ steps.meta.outputs.apk }}

@@ -48,17 +48,22 @@ object ProviderBridge {
     )
 
     /** Compact transcript of prior turns — typed in on COLD sessions only, so a
-     *  provider the user just switched to still knows the thread. */
+     *  provider the user just switched to still knows the thread.
+     *  v1.3.0: hard-capped small (last turns, ~1600 chars total). The old 3.5k
+     *  transcript made every cold send slow to type, hit composer length
+     *  limits on several providers, and left visible garbage when a send
+     *  failed. duck.ai doesn't need this at all anymore — its API lane takes
+     *  the real message array. */
     fun contextPrefixFor(messages: List<ChatMessage>, memoryContext: String? = null): String {
-        val prior = messages.dropLast(1).filter { it.content.isNotBlank() }
-        val transcript = if (prior.isEmpty()) "" else prior
-            .joinToString("\n") { "${if (it.role == "user") "User" else "Assistant"}: ${it.content.take(1200)}" }
-            .let { if (it.length > 3500) "…(earlier turns trimmed)…\n" + it.takeLast(3200) else it }
+        val prior = messages.dropLast(1).filter { it.content.isNotBlank() }.takeLast(2)
+        val transcript = prior
+            .joinToString("\n") { "${if (it.role == "user") "User" else "Assistant"}: ${it.content.take(700)}" }
+            .let { if (it.length > 1600) it.takeLast(1550) else it }
         return when {
             transcript.isNotBlank() ->
                 "Earlier in this conversation (you were the assistant). Continue seamlessly from the last message:\n$transcript"
             !memoryContext.isNullOrBlank() ->
-                "Context about the user and this conversation (memory):\n$memoryContext"
+                "Context about the user and this conversation (memory):\n${memoryContext.take(700)}"
             else -> ""
         }
     }

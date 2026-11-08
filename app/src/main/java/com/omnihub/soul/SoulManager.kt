@@ -37,28 +37,43 @@ class SoulManager(context: Context) {
             t.startsWith("[") && t.contains("] relayed")
     }
 
+    /**
+     * v1.3.0 — memory distills from the USER's turn ONLY.
+     *
+     * The old version stored `assistantReply.take(400)` as the unit body and
+     * `assistantReply.take(200)` as the summary. A creative reply (a story, a
+     * roleplay continuation) thus became "memory" and was injected into every
+     * later conversation on every provider — which is exactly how the Kai &
+     * Lena story started answering unrelated questions across three
+     * providers. Structural fix at the root: what the USER says is memory;
+     * what the AI writes is conversation, never memory. The thread itself
+     * still rides with the request (transcript continuity), so nothing is
+     * lost — it just never pollutes the durable profile.
+     */
     suspend fun learnFromExchange(
         sourceId: String,
         messages: List<ChatMessage>,
         assistantReply: String,
         conversationId: String?
     ) = withContext(Dispatchers.Default) {
-        if (assistantReply.isBlank() || isJunk(assistantReply)) return@withContext
         val userText = messages.lastOrNull { it.role == "user" }?.content.orEmpty()
         if (userText.isBlank()) return@withContext
+        if (isJunk(userText)) return@withContext
         val convId = conversationId ?: UUID.randomUUID().toString()
         val topic = extractTopic(userText)
+        val distilled = distillUserTurn(userText)
+        if (distilled.isBlank()) return@withContext
         val unit = SoulUnit(
             id = "soul-${UUID.randomUUID()}",
             type = SoulType.CONVERSATION,
-            content = "User: ${userText.take(300)}\nAssistant: ${assistantReply.take(400)}",
+            content = "User said: $distilled",
             sourceId = sourceId,
             conversationId = convId,
             topic = topic,
-            summary = assistantReply.take(200),
-            keyFacts = extractFacts(userText + "\n" + assistantReply),
-            tags = extractTags(userText + " " + assistantReply),
-            importance = 0.6,
+            summary = distilled.take(200),
+            keyFacts = extractFacts(userText),
+            tags = extractTags(userText),
+            importance = 0.7,
             policy = SoulPolicy.LONG_TERM
         )
         synchronized(soulUnits) {
@@ -69,6 +84,15 @@ class SoulManager(context: Context) {
             }
             persist()
         }
+    }
+
+    /** The user's ask, compacted: first sentences, hard-capped. No reply prose. */
+    private fun distillUserTurn(userText: String): String {
+        val clean = userText.replace(Regex("\\s+"), " ").trim()
+        if (clean.length <= 200) return clean
+        val cut = clean.take(200)
+        val sentenceEnd = maxOf(cut.lastIndexOf(". "), cut.lastIndexOf("? "), cut.lastIndexOf("! "))
+        return if (sentenceEnd > 80) cut.take(sentenceEnd + 1) else "$cut…"
     }
 
     suspend fun learnFromConversation(
@@ -86,11 +110,19 @@ class SoulManager(context: Context) {
                 .sortedByDescending { it.importance * it.createdAt }
                 .take(maxUnits)
             if (recent.isEmpty()) return@withContext ""
+            // Hard cap: memory is background seasoning, never a second prompt.
+            var total = 0
+            val lines = mutableListOf<String>()
+            for (u in recent) {
+                val line = "- ${u.topic.ifBlank { u.summary.take(40) }}: ${u.summary.take(120)}"
+                if (total + line.length > 700) break
+                lines.add(line)
+                total += line.length
+            }
+            if (lines.isEmpty()) return@withContext ""
             buildString {
-                append("## Omni memory\n")
-                recent.forEach { u ->
-                    append("- ${u.topic.ifBlank { u.summary.take(40) }}: ${u.summary.take(120)}\n")
-                }
+                append("## Omni memory (background facts about the user; not part of the current request)\n")
+                lines.forEach { append("$it\n") }
             }
         }
     }
@@ -105,10 +137,18 @@ class SoulManager(context: Context) {
         try {
             if (unitsFile.exists()) {
                 val arr = JSONArray(unitsFile.readText())
+                var droppedLegacy = false
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
                     val summary = o.optString("summary")
                     val content = o.optString("content")
+                    // Pre-1.3.0 units embedded assistant prose ("User: …\nAssistant: …")
+                    // — the story-pollution format. One-time structural migration:
+                    // drop every unit of the old shape.
+                    if (content.contains("\nAssistant: ") || content.startsWith("User: ")) {
+                        droppedLegacy = true
+                        continue
+                    }
                     if (isJunk(summary) || isJunk(content)) continue
                     soulUnits.add(
                         SoulUnit(
@@ -125,8 +165,8 @@ class SoulManager(context: Context) {
                         )
                     )
                 }
-                // Rewrite clean file if we dropped junk
-                persist()
+                // Rewrite clean file if we dropped junk or legacy units
+                if (droppedLegacy) persist()
             }
         } catch (e: Exception) {
             Log.w(TAG, "load failed: ${e.message}")
