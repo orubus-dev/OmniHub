@@ -161,7 +161,7 @@ fun TerminalScreen(onBack: () -> Unit) {
                     enabled = !running && input.isNotBlank()
                 ) {
                     if (running) {
-                        CircularProgressIndicator(OmniAmber, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        CircularProgressIndicator(color = OmniAmber, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                     } else {
                         Icon(Icons.Default.Send, "Run", tint = if (input.isNotBlank()) OmniAmber else Color(0xFF55555C))
                     }
