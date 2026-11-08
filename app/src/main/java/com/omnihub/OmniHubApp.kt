@@ -9,6 +9,7 @@ import com.omnihub.core.OmniRouter
 import com.omnihub.history.ChatRepository
 import com.omnihub.history.IncognitoRetention
 import com.omnihub.localapi.LocalGateway
+import com.omnihub.localapi.McpTunnel
 import com.omnihub.mcp.McpClient
 import com.omnihub.providers.ProviderRegistry
 import com.omnihub.providers.impl.ProviderBootstrap
@@ -20,6 +21,8 @@ import com.omnihub.source.SourceRouter
 import com.omnihub.source.core.ProviderAuthStore
 import com.omnihub.source.core.WarmSessionPool
 import com.omnihub.terminal.OmniTerminal
+import com.omnihub.tools.ToolHost
+import com.omnihub.tools.ToolLoopEngine
 import com.omnihub.workspace.OmniWorkspace
 
 class OmniHubApp : Application() {
@@ -49,6 +52,12 @@ class OmniHubApp : Application() {
         private set
     lateinit var terminal: OmniTerminal
         private set
+    lateinit var toolHost: ToolHost
+        private set
+    lateinit var toolLoop: ToolLoopEngine
+        private set
+    lateinit var mcpTunnel: McpTunnel
+        private set
     var localGateway: LocalGateway? = null
         private set
 
@@ -66,9 +75,12 @@ class OmniHubApp : Application() {
         analyticsRepo = AnalyticsRepository(analytics, chatRepo, soul)
         workspace = OmniWorkspace(this)
         terminal = OmniTerminal(this, workspace)
+        sourceRouter = SourceRouter(sourceManager, soul, issueReporter)
+        toolHost = ToolHost(this, terminal, workspace, soul, mcp)
+        toolLoop = ToolLoopEngine(sourceRouter, toolHost)
+        mcpTunnel = McpTunnel(toolHost, mcp)
         ProviderBootstrap.reload(this, registry)
         router = OmniRouter(registry)
-        sourceRouter = SourceRouter(sourceManager, soul, issueReporter)
         IncognitoRetention.purgeExpired(this)
         if (getSharedPreferences("omnihub_localapi", MODE_PRIVATE).getBoolean("enabled", false)) {
             try { startLocalGateway() } catch (_: Exception) { }

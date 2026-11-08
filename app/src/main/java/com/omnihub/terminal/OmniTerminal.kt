@@ -26,11 +26,14 @@ class OmniTerminal(
         command: String,
         shell: Shell = Shell.SH,
         timeoutSec: Long = 60,
-        workDir: File? = null
+        workDir: File? = null,
+        origin: TerminalLog.Origin = TerminalLog.Origin.USER
     ): Result = withContext(Dispatchers.IO) {
         val risk = classify(command)
         if (!PermissionEngine.allow(risk)) {
-            return@withContext Result(-1, "", "Blocked by permission engine (risk=$risk)", shell.name)
+            val blocked = Result(-1, "", "Blocked by permission engine (risk=$risk)", shell.name)
+            TerminalLog.record(origin, command, blocked.stderr, blocked.exitCode)
+            return@withContext blocked
         }
         val cwd = workDir ?: workspace.root()
         val binary = when (shell) {
@@ -45,14 +48,26 @@ class OmniTerminal(
         env["HOME"] = cwd.absolutePath
         env["OMNI_HOME"] = cwd.absolutePath
         val proc = pb.start()
+        // Drain streams on side threads into buffers — a command that fills the
+        // pipe buffer while stderr is also open deadlocks waitFor() otherwise.
+        val outBuf = java.lang.StringBuilder()
+        val errBuf = java.lang.StringBuilder()
+        val outThread = Thread { runCatching { proc.inputStream.bufferedReader().forEachLine { outBuf.append(it).append('\n') } } }
+        val errThread = Thread { runCatching { proc.errorStream.bufferedReader().forEachLine { errBuf.append(it).append('\n') } } }
+        outThread.start(); errThread.start()
         val finished = proc.waitFor(timeoutSec, TimeUnit.SECONDS)
         if (!finished) {
             proc.destroyForcibly()
-            return@withContext Result(-1, "", "Timed out after ${timeoutSec}s", shell.name)
+            val timeout = Result(-1, "", "Timed out after ${timeoutSec}s", shell.name)
+            TerminalLog.record(origin, command, timeout.stderr, timeout.exitCode)
+            return@withContext timeout
         }
-        val out = proc.inputStream.bufferedReader().readText()
-        val err = proc.errorStream.bufferedReader().readText()
-        Result(proc.exitValue(), out, err, shell.name)
+        outThread.join(3000); errThread.join(3000)
+        val out = outBuf.toString()
+        val err = errBuf.toString()
+        val r = Result(proc.exitValue(), out, err, shell.name)
+        TerminalLog.record(origin, command, (out + if (err.isBlank()) "" else "\n[stderr]\n$err").trim(), r.exitCode)
+        r
     }
 
     suspend fun git(args: String): Result =

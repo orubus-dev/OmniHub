@@ -41,6 +41,7 @@ import com.omnihub.source.SourceRouter
 import com.omnihub.source.SourceHealth
 import com.omnihub.source.core.ProviderAuthStore
 import com.omnihub.source.core.WarmSessionPool
+import com.omnihub.tools.ToolLoopEngine
 import com.omnihub.update.AppUpdateChecker
 import com.omnihub.update.AppUpdateInfo
 import com.omnihub.ui.theme.OmniAmber
@@ -112,7 +113,8 @@ fun ChatScreen(
     onOpenProjects: () -> Unit = {},
     onOpenSources: () -> Unit = {},
     onOpenStore: () -> Unit = {},
-    onOpenConnectors: () -> Unit = {}
+    onOpenConnectors: () -> Unit = {},
+    onOpenTerminal: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val app = context.applicationContext as OmniHubApp
@@ -147,6 +149,9 @@ fun ChatScreen(
     var replySource by remember { mutableStateOf("") }
     var replyMs by remember { mutableStateOf(0L) }
     var elapsedSec by remember { mutableStateOf(0) }
+    // Tool activity of the in-flight reply (⚙️ started / ✓ finished lines)
+    var toolTrace by remember { mutableStateOf(listOf<String>()) }
+    var replyToolCalls by remember { mutableStateOf(0) }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         if (uris.isNotEmpty()) pendingAttachments = pendingAttachments + uris.map { it.toString() }
@@ -238,6 +243,8 @@ fun ChatScreen(
         uiLocked = true
         replySource = ""
         replyMs = 0
+        replyToolCalls = 0
+        toolTrace = emptyList()
         val baseline = messages
         messages = baseline + ChatBubble("user", userText) + ChatBubble("assistant", "")
 
@@ -258,21 +265,29 @@ fun ChatScreen(
                 val hist = (baseline + ChatBubble("user", userText)).map { ChatMessage(it.role, it.content) }
 
                 var finalText = ""
-                app.sourceRouter.chatStream(
+                app.toolLoop.run(
                     messages = hist,
                     preferredSourceId = if (preferred == "auto") null else preferred,
                     conversationId = convId
                 ).collect { ev ->
                     when (ev) {
-                        is SourceRouter.RouteEvent.Delta -> {
+                        is ToolLoopEngine.LoopEvent.Delta -> {
                             answering = true
                             // Cumulative snapshot — REPLACE the live bubble
                             messages = baseline + ChatBubble("user", userText) + ChatBubble("assistant", ev.text)
                         }
-                        is SourceRouter.RouteEvent.Done -> {
+                        is ToolLoopEngine.LoopEvent.ToolStarted -> {
+                            toolTrace = toolTrace + "⚙️ ${ev.tool}(${ev.argsPreview})"
+                        }
+                        is ToolLoopEngine.LoopEvent.ToolFinished -> {
+                            val mark = if (ev.ok) "✓" else "✗"
+                            toolTrace = toolTrace + "$mark ${ev.tool}: ${ev.outputPreview.take(120)}"
+                        }
+                        is ToolLoopEngine.LoopEvent.Done -> {
                             finalText = ev.content
                             replySource = ev.sourceName
                             replyMs = ev.elapsedMs
+                            replyToolCalls = ev.toolCalls
                         }
                     }
                 }
@@ -312,6 +327,7 @@ fun ChatScreen(
                 NavigationDrawerItem(icon = { Icon(Icons.Outlined.Folder, null, tint = OmniAmber) }, label = { Text("Projects") }, selected = false, onClick = { scope.launch { drawerState.close() }; onOpenProjects() })
                 NavigationDrawerItem(icon = { Icon(Icons.Outlined.Store, null, tint = OmniAmber) }, label = { Text("Store") }, selected = false, onClick = { scope.launch { drawerState.close() }; onOpenStore() })
                 NavigationDrawerItem(icon = { Icon(Icons.Outlined.Extension, null, tint = OmniAmber) }, label = { Text("Connectors") }, selected = false, onClick = { scope.launch { drawerState.close() }; onOpenConnectors() })
+                NavigationDrawerItem(icon = { Icon(Icons.Default.Terminal, null, tint = OmniAmber) }, label = { Text("Terminal") }, selected = false, onClick = { scope.launch { drawerState.close() }; onOpenTerminal() })
                 HorizontalDivider(color = OmniGlassBorder, modifier = Modifier.padding(vertical = 8.dp))
                 Text("Chats", Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LazyColumn(Modifier.weight(1f)) {
@@ -438,13 +454,25 @@ fun ChatScreen(
                                                             Text(msg.content, style = MaterialTheme.typography.bodyLarge)
                                                         }
                                                     }
+                                                    // Live tool activity under the streaming reply
+                                                    if (isLiveAssistant && toolTrace.isNotEmpty()) {
+                                                        Spacer(Modifier.height(6.dp))
+                                                        toolTrace.takeLast(4).forEach { line ->
+                                                            Text(
+                                                                line,
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                color = OmniAmber,
+                                                                modifier = Modifier.padding(vertical = 1.dp)
+                                                            )
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
                                         // "who answered · how fast" — only on a finished real reply
                                         if (!mine && !sending && idx == messages.lastIndex && replySource.isNotBlank() && !isErr) {
                                             Text(
-                                                "via $replySource · ${"%.1f".format(replyMs / 1000f)}s",
+                                                "via $replySource · ${"%.1f".format(replyMs / 1000f)}s" + if (replyToolCalls > 0) " · ⚙️$replyToolCalls" else "",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 modifier = Modifier.padding(top = 2.dp, start = 6.dp)

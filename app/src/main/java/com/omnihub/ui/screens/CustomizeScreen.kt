@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.omnihub.OmniHubApp
+import com.omnihub.ui.theme.OmniAmber
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -166,29 +167,93 @@ private fun ToneTab() {
 private fun McpServerTab() {
     val app = OmniHubApp.instance
     val scope = rememberCoroutineScope()
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
     var url by remember { mutableStateOf("") }
+    var token by remember { mutableStateOf("") }
     var status by remember { mutableStateOf<String?>(null) }
     var servers by remember { mutableStateOf(app.mcp.listServers()) }
+
+    // One-tap templates: the official remote MCP endpoints people actually paste
+    data class Template(val label: String, val endpoint: String, val hint: String, val tokenHint: String?)
+    val templates = listOf(
+        Template("GitHub", "https://api.githubcopilot.com/mcp/", "Repos · issues · PRs · code search", "GitHub PAT (github.com/settings/tokens)"),
+        Template("Vercel", "https://mcp.vercel.com", "Deployments · projects · domains · logs", "Vercel access token"),
+        Template("Supabase", "https://mcp.supabase.com/mcp", "Database · auth · storage · edge functions", "Supabase access token"),
+        Template("Context7", "https://mcp.context7.com/mcp", "Up-to-date library docs", null)
+    )
+
+    fun connect(target: String, tok: String?) {
+        if (target.isBlank()) return
+        status = "Handshaking with ${target.take(48)}…"
+        scope.launch {
+            val result = app.mcp.connect(target, token = tok?.trim()?.takeIf { it.isNotBlank() })
+            result.fold(
+                onSuccess = { s ->
+                    status = if (s.connected)
+                        "✓ ${s.name} — ${s.tools.size} tools live in chat"
+                    else "Saved but handshake failed: ${s.lastError}"
+                    servers = app.mcp.listServers()
+                },
+                onFailure = { e ->
+                    status = "Failed: ${e.message}"
+                    servers = app.mcp.listServers()
+                }
+            )
+        }
+    }
 
     Column(
         Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text("MCP Servers", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Text(
-            "Paste an MCP server URL (Streamable HTTP or SSE). OmniHub performs the full MCP handshake — initialize, session, tools — then its tools are available to your assistant.",
+            "Paste any MCP server link (Streamable HTTP or SSE). OmniHub runs the full handshake — initialize, session, tools — and every tool becomes available to your AI, in chat and over the tunnel.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.outline
         )
+
+        // Quick add
+        Text("Quick add", style = MaterialTheme.typography.titleSmall)
+        templates.forEach { t ->
+            Card(
+                modifier = Modifier.fillMaxWidth().clickable {
+                    url = t.endpoint
+                    connect(t.endpoint, token.takeIf { it.isNotBlank() })
+                },
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(t.label, fontWeight = FontWeight.SemiBold, color = OmniAmber)
+                    Text("${t.endpoint} — ${t.hint}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                    t.tokenHint?.let {
+                        Text("Needs token: $it (paste below first)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    }
+                }
+            }
+        }
+
+        Divider()
 
         OutlinedTextField(
             value = url,
             onValueChange = { url = it },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("MCP Server URL") },
-            placeholder = { Text("https://mcp.example.com/sse") },
+            placeholder = { Text("https://mcp.example.com/mcp") },
+            shape = RoundedCornerShape(12.dp),
+            singleLine = true
+        )
+        OutlinedTextField(
+            value = token,
+            onValueChange = { token = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Bearer token (optional)") },
+            placeholder = { Text("ghp_… / vercel_… / sbp_…") },
             shape = RoundedCornerShape(12.dp),
             singleLine = true
         )
@@ -196,25 +261,8 @@ private fun McpServerTab() {
         Button(
             onClick = {
                 val target = url.trim()
-                if (target.isNotBlank()) {
-                    url = ""
-                    status = "Handshaking with ${target.take(40)}…"
-                    scope.launch {
-                        val result = app.mcp.connect(target)
-                        result.fold(
-                            onSuccess = { s ->
-                                status = if (s.connected)
-                                    "Connected: ${s.name} — ${s.tools.size} tools"
-                                else "Server saved but handshake failed: ${s.lastError}"
-                                servers = app.mcp.listServers()
-                            },
-                            onFailure = { e ->
-                                status = "Failed: ${e.message}"
-                                servers = app.mcp.listServers()
-                            }
-                        )
-                    }
-                }
+                url = ""
+                connect(target, token)
             },
             modifier = Modifier.fillMaxWidth(),
             enabled = url.isNotBlank()
@@ -226,6 +274,57 @@ private fun McpServerTab() {
 
         status?.let {
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        }
+
+        Divider()
+
+        // Device-as-tunnel card
+        val gwRunning = com.omnihub.localapi.LocalGateway.running.get()
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = OmniAmber.copy(alpha = 0.08f))
+        ) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.DeviceHub, null, tint = OmniAmber, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Device tunnel (this phone = an MCP server)", fontWeight = FontWeight.SemiBold)
+                }
+                if (gwRunning) {
+                    val lan = app.mcpTunnel.lanAddresses(com.omnihub.localapi.LocalGateway.DEFAULT_PORT)
+                    Text(
+                        "Point any MCP client (Claude Desktop, Cursor, Claude Code) at:",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        "http://127.0.0.1:${com.omnihub.localapi.LocalGateway.DEFAULT_PORT}/mcp" +
+                            (lan.firstOrNull()?.let { "\n$it (LAN)" } ?: ""),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = OmniAmber,
+                        modifier = Modifier.clickable {
+                            clipboard.setText(
+                                androidx.compose.ui.text.AnnotatedString(
+                                    lan.firstOrNull()
+                                        ?: "http://127.0.0.1:${com.omnihub.localapi.LocalGateway.DEFAULT_PORT}/mcp"
+                                )
+                            )
+                            status = "Tunnel URL copied"
+                        }
+                    )
+                    Text(
+                        "They get: on-device terminal + files + memory, plus every MCP server connected above — proxied through your phone.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                } else {
+                    Text(
+                        "Enable the Local Gateway in Settings → OmniRoute to expose this device as an MCP endpoint.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline
+                    )
+                }
+            }
         }
 
         Divider()
@@ -261,12 +360,18 @@ private fun McpServerTab() {
                     if (server.connected) {
                         Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.primary)
                     }
-                    TextButton(onClick = {
-                        app.mcp.disconnect(server.id)
-                        servers = app.mcp.listServers()
-                    }) { Text("Remove") }
+                    Column {
+                        TextButton(onClick = {
+                            connect(server.url, null)
+                        }) { Text("Retry") }
+                        TextButton(onClick = {
+                            app.mcp.disconnect(server.id)
+                            servers = app.mcp.listServers()
+                        }) { Text("Remove") }
+                    }
                 }
             }
         }
+        Spacer(Modifier.height(24.dp))
     }
 }

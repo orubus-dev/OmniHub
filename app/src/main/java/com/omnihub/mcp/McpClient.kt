@@ -248,9 +248,16 @@ class McpClient(private val context: Context) {
 
     // ---------- connect ----------
 
-    suspend fun connect(url: String, name: String = "MCP Server"): Result<McpServer> =
+    suspend fun connect(url: String, name: String = "MCP Server", token: String? = null): Result<McpServer> =
         withContext(Dispatchers.IO) {
             val safeUrl = try { validateUrl(url) } catch (e: Exception) { return@withContext Result.failure(e) }
+            // Re-connecting an existing endpoint replaces the old entry instead of piling up duplicates.
+            val normalized = safeUrl.trimEnd('/')
+            listServers().find { it.url.trimEnd('/') == normalized }?.let { prev ->
+                sessions.remove(prev.id)?.let { closeSession(it) }
+                prefs.edit().remove("server_${prev.id}").apply()
+            }
+            if (!token.isNullOrBlank()) setTokenForUrl(normalized, token)
             val id = java.util.UUID.randomUUID().toString()
 
             // 1) Streamable HTTP
@@ -314,6 +321,26 @@ class McpClient(private val context: Context) {
         val sessionId: String? = null,
         val session: Session? = null
     )
+
+    /** Attach a bearer token to a URL before handshake so tokenFor() picks it up. */
+    private fun setTokenForUrl(normalizedUrl: String, token: String) {
+        // Token keyed by a stable hash of the URL — works even before a server id exists.
+        SecureStore.putSecret(context, "mcp_tokurl_${normalizedUrl.hashCode()}", token)
+        tempUrlTokens[normalizedUrl] = token
+    }
+
+    private val tempUrlTokens = ConcurrentHashMap<String, String>()
+
+    fun serverById(id: String): McpServer? = listServers().find { it.id == id }
+
+    /** Tool call by server id + tool name — the path the ToolHost and the tunnel use. */
+    suspend fun callToolByRef(serverId: String, toolName: String, arguments: JSONObject): Result<String> {
+        val server = serverById(serverId)
+            ?: return Result.failure(IllegalArgumentException("Unknown MCP server $serverId"))
+        val args = mutableMapOf<String, Any>()
+        arguments.keys().forEach { k -> args[k] = arguments.get(k) }
+        return callTool(server, toolName, args)
+    }
 
     private fun handshakeStreamableHttp(url: String): Handshake? {
         val initId = nextId()
@@ -563,8 +590,12 @@ class McpClient(private val context: Context) {
         SecureStore.getSecret(context, "mcp_token_$serverId")
 
     private fun tokenFor(url: String): String? {
+        val normalized = url.trimEnd('/')
+        // Pre-handshake token (set together with connect(url, token=…)) wins first.
+        tempUrlTokens[normalized]?.let { return it }
+        SecureStore.getSecret(context, "mcp_tokurl_${normalized.hashCode()}")?.let { return it }
         return listServers().find { s ->
-            url.startsWith(s.url.trimEnd('/')) || s.url.trimEnd('/') == url.trimEnd('/')
+            url.startsWith(s.url.trimEnd('/')) || s.url.trimEnd('/') == normalized
         }?.let { getToken(it.id) }
     }
 

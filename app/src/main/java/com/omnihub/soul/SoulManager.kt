@@ -59,6 +59,9 @@ class SoulManager(context: Context) {
         val userText = messages.lastOrNull { it.role == "user" }?.content.orEmpty()
         if (userText.isBlank()) return@withContext
         if (isJunk(userText)) return@withContext
+        // ToolLoop protocol traffic (tool results / reminders) is app plumbing,
+        // never durable memory about the user.
+        if (userText.trimStart().startsWith("[TOOL_RESULT")) return@withContext
         val convId = conversationId ?: UUID.randomUUID().toString()
         val topic = extractTopic(userText)
         val distilled = distillUserTurn(userText)
@@ -86,9 +89,12 @@ class SoulManager(context: Context) {
         }
     }
 
-    /** The user's ask, compacted: first sentences, hard-capped. No reply prose. */
+    /** The user's ask, compacted: first sentences, hard-capped. No reply prose.
+     *  ToolLoop manifest (appended after the — — — delimiter) is protocol,
+     *  not the user's words — cut there first. */
     private fun distillUserTurn(userText: String): String {
-        val clean = userText.replace(Regex("\\s+"), " ").trim()
+        val body = userText.substringBefore("\n— — —")
+        val clean = body.replace(Regex("\\s+"), " ").trim()
         if (clean.length <= 200) return clean
         val cut = clean.take(200)
         val sentenceEnd = maxOf(cut.lastIndexOf(". "), cut.lastIndexOf("? "), cut.lastIndexOf("! "))
@@ -128,6 +134,34 @@ class SoulManager(context: Context) {
     }
 
     fun unitCount(): Int = synchronized(soulUnits) { soulUnits.size }
+
+    /**
+     * Explicit memory written by the assistant through the memory_save tool
+     * (or the tunnel). Unlike learnFromExchange this stores what was ASKED to
+     * be remembered, verbatim, at high importance so it surfaces in every
+     * later prompt context.
+     */
+    suspend fun rememberExplicit(text: String, topic: String = "fact") = withContext(Dispatchers.Default) {
+        val clean = text.replace(Regex("\\s+"), " ").trim()
+        if (clean.isBlank() || isJunk(clean)) return@withContext
+        val unit = SoulUnit(
+            id = "soul-${UUID.randomUUID()}",
+            type = SoulType.FACT,
+            content = clean,
+            sourceId = "assistant",
+            conversationId = "",
+            topic = topic.take(60),
+            summary = clean.take(200),
+            keyFacts = listOf(clean.take(160)),
+            tags = listOf("explicit"),
+            importance = 1.2,
+            policy = SoulPolicy.LONG_TERM
+        )
+        synchronized(soulUnits) {
+            soulUnits.add(unit)
+            persist()
+        }
+    }
 
     fun loadUnits(): List<SoulUnit> = synchronized(soulUnits) {
         soulUnits.filter { !isJunk(it.summary) && !isJunk(it.content) }

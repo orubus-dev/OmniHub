@@ -81,6 +81,7 @@ class LocalGateway(
             )
             uri.endsWith("/v1/models") -> models()
             uri.endsWith("/v1/chat/completions") -> chatCompletions(session)
+            uri == "/mcp" -> mcpTunnel(session)
             else -> error(Response.Status.NOT_FOUND, "unknown route $uri")
         }
     }
@@ -241,7 +242,34 @@ class LocalGateway(
     }
 
     /**
-     * "sourceId/modelId" → that source directly; "auto"/anything else →
+     * MCP Tunnel endpoint — the device IS an MCP server. Streamable HTTP with
+     * JSON responses; initialize → tools/list → tools/call over JSON-RPC 2.0.
+     */
+    private fun mcpTunnel(session: IHTTPSession): Response {
+        if (session.method == Method.GET) {
+            // Clients may probe; a plain SSE-less GET is answered with the server card.
+            return ok(
+                JSONObject()
+                    .put("server", "OmniHub Tunnel")
+                    .put("protocol", "MCP 2025-03-26 (Streamable HTTP, JSON responses)")
+                    .put("endpoint", "/mcp")
+            )
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val raw = files["postData"] ?: throw IllegalStateException("empty body")
+        val rpc = JSONObject(raw)
+        val (status, body, sid) = kotlinx.coroutines.runBlocking { app.mcpTunnel.handleRpc(rpc) }
+        if (body == null || status != 200) {
+            // Notifications and pings: 202 Accepted, empty body per spec
+            return newFixedLengthResponse(Response.Status.ACCEPTED, "text/plain", "")
+        }
+        val resp = newFixedLengthResponse(Response.Status.OK, "application/json", body.toString())
+        sid?.let { resp.addHeader("Mcp-Session-Id", it) }
+        return resp
+    }
+
+    /** "sourceId/modelId" → that source directly; "auto"/anything else →
      * SourceRouter fallback chain with soul memory injected.
      */
     private suspend fun runCompletion(modelId: String, messages: List<ChatMessage>): Pair<String, String> {
