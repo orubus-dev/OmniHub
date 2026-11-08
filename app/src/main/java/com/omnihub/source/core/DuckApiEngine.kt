@@ -86,6 +86,8 @@ object DuckApiEngine {
             } catch (_: Exception) {
             }
 
+            lateinit var timeoutRunnable: Runnable
+
             fun finish(text: String, ok: Boolean) {
                 if (finished) return
                 finished = true
@@ -105,7 +107,6 @@ object DuckApiEngine {
                 if (cont.isActive) cont.resume(WebViewChatEngine.Result(text, ok, txn))
             }
 
-            lateinit var timeoutRunnable: Runnable
             timeoutRunnable = Runnable {
                 if (finished) return@Runnable
                 // A stream that is still growing is alive — extend once per 20s,
